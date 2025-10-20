@@ -1,205 +1,396 @@
 #!/usr/bin/env python3
 """
-Bot Telegram para automação de pagamentos Liquid
-Integração com DEPIX/EULEN API
-Fluxo: Recebe pagamento -> Desconta comissão -> Envia para carteiras
+Bot Telegram para cobranças automáticas via Atlas DAO
+Fluxo: Configura dia + valor → Gera cobrança automática todo mês
 """
 
 import os
-import time
+import json
+import random
+import string
 import logging
+from datetime import datetime, time
+from typing import Dict
 import requests
-from typing import Set, Dict, List
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
 
-# Configuração de logging
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler
+)
+
+# Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Configurações do ambiente
+# Configurações
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-MNEMONIC = os.getenv('MNEMONIC')
-COMMISSION_ADDRESS = os.getenv('COMMISSION_ADDRESS')
-MERCHANT_ADDRESS = os.getenv('MERCHANT_ADDRESS')
-COMMISSION_RATE = float(os.getenv('COMMISSION_RATE', '0.02'))
-NETWORK = os.getenv('NETWORK', 'mainnet')
+WALLET_ADDRESS = os.getenv('WALLET_ADDRESS', 'CONFIGURE_WALLET_LWK')
+ATLAS_API_KEY = 'atlas_ceaf6237e499f94dfe87ef62b19e25b360293369cbacfdf99760ee255761b5f5'
+ATLAS_API_URL = 'https://api.atlasdao.info/api/v1'
 
-# Configuração da LWK
-try:
-    from lwk import Mnemonic as LwkMnemonic, Network, Signer, Wollet
-    LWK_AVAILABLE = True
-except ImportError:
-    logger.warning("LWK não disponível, algumas funcionalidades estarão limitadas")
-    LWK_AVAILABLE = False
+# Estados da conversa
+WAITING_DAY, WAITING_AMOUNT = range(2)
+
+# Arquivo para salvar dados dos usuários
+DATA_FILE = 'usuarios.json'
 
 
-class LiquidBot:
-    """Bot principal para gerenciar pagamentos Liquid"""
+class ClienteManager:
+    """Gerencia dados dos clientes"""
     
     def __init__(self):
-        # Validar configurações obrigatórias
-        if not TELEGRAM_TOKEN:
-            raise ValueError("TELEGRAM_TOKEN não configurado!")
-        
-        # Inicializar bot Telegram
-        self.app = Application.builder().token(TELEGRAM_TOKEN).build()
-        
-        # Inicializar LWK wallet (se disponível)
-        self.wollet = None
-        self.signer = None
-        if LWK_AVAILABLE and MNEMONIC:
-            self.setup_wallet()
-        
-        # Estado do bot
-        self.processed_payments: Set[str] = set()
-        
-        # Configurar comandos
-        self.setup_handlers()
+        self.clientes: Dict = self.load_data()
     
-    def setup_wallet(self):
-        """Configura carteira LWK"""
+    def load_data(self) -> Dict:
+        """Carrega dados do arquivo"""
         try:
-            logger.info("🔧 Configurando carteira Liquid...")
-            
-            # Criar mnemonic
-            mnemonic = LwkMnemonic(MNEMONIC)
-            
-            # Definir rede
-            network = Network.mainnet() if NETWORK == 'mainnet' else Network.testnet()
-            
-            # Criar signer
-            self.signer = Signer(mnemonic, network)
-            
-            # Obter descriptor
-            desc = self.signer.singlesig_desc()
-            
-            # Criar wallet watch-only
-            self.wollet = Wollet(network, desc, None)
-            
-            # Mostrar endereço
-            address = self.wollet.address()
-            logger.info(f"✅ Carteira configurada!")
-            logger.info(f"📬 Endereço: {address.address()}")
-            
+            if os.path.exists(DATA_FILE):
+                with open(DATA_FILE, 'r') as f:
+                    return json.load(f)
+            return {}
         except Exception as e:
-            logger.error(f"❌ Erro ao configurar carteira: {e}")
-            self.wollet = None
+            logger.error(f"Erro ao carregar dados: {e}")
+            return {}
     
-    def setup_handlers(self):
-        """Configura comandos do bot Telegram"""
-        self.app.add_handler(CommandHandler("start", self.cmd_start))
-        self.app.add_handler(CommandHandler("status", self.cmd_status))
-        self.app.add_handler(CommandHandler("endereco", self.cmd_endereco))
-        self.app.add_handler(CommandHandler("saldo", self.cmd_saldo))
-        self.app.add_handler(CommandHandler("help", self.cmd_help))
+    def save_data(self):
+        """Salva dados no arquivo"""
+        try:
+            with open(DATA_FILE, 'w') as f:
+                json.dump(self.clientes, f, indent=2)
+        except Exception as e:
+            logger.error(f"Erro ao salvar dados: {e}")
     
-    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Comando /start"""
+    def add_cliente(self, user_id: int, username: str, dia: int, valor: float):
+        """Adiciona ou atualiza cliente"""
+        self.clientes[str(user_id)] = {
+            'username': username,
+            'dia_pagamento': dia,
+            'valor': valor,
+            'ativo': True,
+            'ultima_cobranca': None
+        }
+        self.save_data()
+    
+    def get_cliente(self, user_id: int):
+        """Retorna dados do cliente"""
+        return self.clientes.get(str(user_id))
+    
+    def get_clientes_do_dia(self, dia: int) -> list:
+        """Retorna clientes que pagam hoje"""
+        return [
+            (user_id, dados) 
+            for user_id, dados in self.clientes.items()
+            if dados['dia_pagamento'] == dia and dados['ativo']
+        ]
+
+
+def gerar_merchant_id() -> str:
+    """Gera merchantOrderId aleatório de 10 caracteres"""
+    caracteres = string.ascii_uppercase + string.digits
+    return ''.join(random.choice(caracteres) for _ in range(10))
+
+
+def formatar_valor(valor: float) -> float:
+    """Garante formato X.XX"""
+    return round(float(valor), 2)
+
+
+async def gerar_cobranca(user_id: int, username: str, valor: float, context: ContextTypes.DEFAULT_TYPE) -> Dict:
+    """Gera cobrança via API Atlas DAO"""
+    
+    merchant_id = gerar_merchant_id()
+    valor_formatado = formatar_valor(valor)
+    
+    payload = {
+        "amount": valor_formatado,
+        "description": f"Pagamento por {username}",
+        "walletAddress": WALLET_ADDRESS,
+        "merchantOrderId": merchant_id
+    }
+    
+    headers = {
+        'X-API-Key': ATLAS_API_KEY,
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        logger.info(f"Gerando cobrança: {payload}")
+        
+        response = requests.post(
+            ATLAS_API_URL,
+            json=payload,
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            logger.info(f"Cobrança gerada com sucesso: {merchant_id}")
+            
+            # Enviar cobrança para o usuário
+            mensagem = (
+                f"💰 *Nova Cobrança Gerada*\n\n"
+                f"Valor: R$ {valor_formatado:.2f}\n"
+                f"ID: `{merchant_id}`\n\n"
+                f"Efetue o pagamento usando o QR Code abaixo:"
+            )
+            
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=mensagem,
+                parse_mode='Markdown'
+            )
+            
+            # Se a API retornar QR code, enviar
+            if 'qrCode' in data:
+                await context.bot.send_photo(
+                    chat_id=user_id,
+                    photo=data['qrCode']
+                )
+            
+            # Se retornar link de pagamento
+            if 'paymentUrl' in data:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"🔗 Link de pagamento: {data['paymentUrl']}"
+                )
+            
+            return {'success': True, 'merchant_id': merchant_id, 'data': data}
+        
+        else:
+            logger.error(f"Erro na API: {response.status_code} - {response.text}")
+            return {'success': False, 'error': response.text}
+    
+    except Exception as e:
+        logger.error(f"Erro ao gerar cobrança: {e}")
+        return {'success': False, 'error': str(e)}
+
+
+# Instância global do gerenciador
+clientes_manager = ClienteManager()
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Comando /start - Inicia configuração"""
+    user = update.effective_user
+    
+    await update.message.reply_text(
+        f"👋 Bem vindo *{user.first_name}*!\n\n"
+        f"Vou configurar sua cobrança automática.\n\n"
+        f"📅 Qual dia do mês você quer pagar? (1-31)",
+        parse_mode='Markdown'
+    )
+    
+    return WAITING_DAY
+
+
+async def receber_dia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe o dia do pagamento"""
+    try:
+        dia = int(update.message.text.strip())
+        
+        if dia < 1 or dia > 31:
+            await update.message.reply_text(
+                "❌ Por favor, digite um dia válido entre 1 e 31."
+            )
+            return WAITING_DAY
+        
+        # Salvar dia temporariamente
+        context.user_data['dia'] = dia
+        
         await update.message.reply_text(
-            "🤖 *Bot Liquid Payments*\n\n"
-            "Bot para automação de pagamentos Liquid Network\n"
-            "com split automático de comissões.\n\n"
-            "Use /help para ver comandos disponíveis.",
+            f"✅ Dia {dia} configurado!\n\n"
+            f"💵 Qual o valor da cobrança?\n"
+            f"(Digite apenas o número, até R$ 3000,00)\n"
+            f"Exemplo: 150"
+        )
+        
+        return WAITING_AMOUNT
+    
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Por favor, digite apenas números.\n"
+            "Exemplo: 15"
+        )
+        return WAITING_DAY
+
+
+async def receber_valor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe o valor do pagamento"""
+    try:
+        valor = float(update.message.text.strip().replace(',', '.'))
+        
+        if valor <= 0 or valor > 3000:
+            await update.message.reply_text(
+                "❌ Valor inválido! Digite um valor entre R$ 0,01 e R$ 3.000,00"
+            )
+            return WAITING_AMOUNT
+        
+        # Recuperar dados
+        dia = context.user_data['dia']
+        user = update.effective_user
+        user_id = user.id
+        username = user.first_name or user.username or f"User{user_id}"
+        
+        # Salvar cliente
+        clientes_manager.add_cliente(user_id, username, dia, valor)
+        
+        await update.message.reply_text(
+            f"✅ *Configuração Completa!*\n\n"
+            f"📅 Dia do pagamento: {dia}\n"
+            f"💰 Valor: R$ {valor:.2f}\n\n"
+            f"Todo dia {dia} você receberá uma cobrança automática.\n\n"
+            f"Use /status para ver sua configuração\n"
+            f"Use /cancelar para cancelar cobranças",
             parse_mode='Markdown'
         )
-    
-    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Comando /help"""
-        help_text = (
-            "📋 *Comandos Disponíveis:*\n\n"
-            "/start - Iniciar bot\n"
-            "/status - Ver status do sistema\n"
-            "/endereco - Ver endereço de recebimento\n"
-            "/saldo - Consultar saldo\n"
-            "/help - Mostrar esta mensagem\n\n"
-            f"⚙️ *Configuração:*\n"
-            f"• Taxa de comissão: {COMMISSION_RATE*100}%\n"
-            f"• Rede: {NETWORK}\n"
-        )
-        await update.message.reply_text(help_text, parse_mode='Markdown')
-    
-    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Comando /status"""
-        status = "✅ Online" if self.wollet else "⚠️ Wallet não configurada"
         
-        info = (
-            f"🤖 *Status do Bot*\n\n"
-            f"Status: {status}\n"
-            f"Rede: {NETWORK}\n"
-            f"Taxa: {COMMISSION_RATE*100}%\n"
-            f"Pagamentos processados: {len(self.processed_payments)}\n"
-        )
-        
-        await update.message.reply_text(info, parse_mode='Markdown')
-    
-    async def cmd_endereco(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Comando /endereco"""
-        if not self.wollet:
-            await update.message.reply_text("❌ Wallet não configurada")
-            return
-        
-        try:
-            address = self.wollet.address()
+        # Se hoje for o dia, gerar cobrança imediatamente
+        hoje = datetime.now().day
+        if hoje == dia:
             await update.message.reply_text(
-                f"📬 *Endereço para receber:*\n\n"
-                f"`{address.address()}`\n\n"
-                f"Envie L-BTC para este endereço.",
-                parse_mode='Markdown'
+                "⏰ Hoje é seu dia de pagamento!\n"
+                "Gerando cobrança agora..."
             )
-        except Exception as e:
-            logger.error(f"Erro ao obter endereço: {e}")
-            await update.message.reply_text(f"❌ Erro: {str(e)}")
-    
-    async def cmd_saldo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Comando /saldo"""
-        if not self.wollet:
-            await update.message.reply_text("❌ Wallet não configurada")
-            return
+            await gerar_cobranca(user_id, username, valor, context)
         
+        return ConversationHandler.END
+    
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Por favor, digite apenas números.\n"
+            "Exemplo: 150 ou 150.50"
+        )
+        return WAITING_AMOUNT
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostra status da configuração"""
+    user_id = update.effective_user.id
+    cliente = clientes_manager.get_cliente(user_id)
+    
+    if not cliente:
+        await update.message.reply_text(
+            "❌ Você ainda não configurou cobranças.\n"
+            "Use /start para começar!"
+        )
+        return
+    
+    await update.message.reply_text(
+        f"📊 *Sua Configuração*\n\n"
+        f"📅 Dia do pagamento: {cliente['dia_pagamento']}\n"
+        f"💰 Valor: R$ {cliente['valor']:.2f}\n"
+        f"✅ Status: {'Ativo' if cliente['ativo'] else 'Cancelado'}\n\n"
+        f"Use /start para reconfigurar\n"
+        f"Use /cancelar para desativar",
+        parse_mode='Markdown'
+    )
+
+
+async def cancelar_cobrancas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancela cobranças automáticas"""
+    user_id = update.effective_user.id
+    cliente = clientes_manager.get_cliente(user_id)
+    
+    if not cliente:
+        await update.message.reply_text("❌ Você não tem cobranças configuradas.")
+        return
+    
+    cliente['ativo'] = False
+    clientes_manager.save_data()
+    
+    await update.message.reply_text(
+        "🛑 Cobranças automáticas canceladas.\n\n"
+        "Use /start para reativar."
+    )
+
+
+async def cancelar_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancela a conversa"""
+    await update.message.reply_text(
+        "❌ Configuração cancelada.\n"
+        "Use /start para começar novamente."
+    )
+    return ConversationHandler.END
+
+
+async def verificar_cobrancas_diarias(context: ContextTypes.DEFAULT_TYPE):
+    """Job que roda diariamente para gerar cobranças"""
+    hoje = datetime.now().day
+    logger.info(f"🔍 Verificando cobranças para o dia {hoje}")
+    
+    clientes_hoje = clientes_manager.get_clientes_do_dia(hoje)
+    
+    if not clientes_hoje:
+        logger.info("Nenhuma cobrança para hoje")
+        return
+    
+    logger.info(f"Encontrados {len(clientes_hoje)} clientes para cobrar")
+    
+    for user_id, dados in clientes_hoje:
         try:
-            # Aqui você implementaria a consulta de saldo real
-            # Por enquanto, apenas placeholder
-            await update.message.reply_text(
-                "💰 *Saldo da Carteira*\n\n"
-                "Função em desenvolvimento...\n"
-                "Em breve você poderá consultar o saldo aqui.",
-                parse_mode='Markdown'
+            resultado = await gerar_cobranca(
+                int(user_id),
+                dados['username'],
+                dados['valor'],
+                context
             )
+            
+            if resultado['success']:
+                # Atualizar última cobrança
+                clientes_manager.clientes[user_id]['ultima_cobranca'] = datetime.now().isoformat()
+                clientes_manager.save_data()
+                logger.info(f"✅ Cobrança gerada para {dados['username']}")
+            else:
+                logger.error(f"❌ Erro ao cobrar {dados['username']}: {resultado.get('error')}")
+        
         except Exception as e:
-            logger.error(f"Erro ao consultar saldo: {e}")
-            await update.message.reply_text(f"❌ Erro: {str(e)}")
-    
-    def run(self):
-        """Inicia o bot"""
-        logger.info("🚀 Iniciando bot...")
-        logger.info(f"📡 Rede: {NETWORK}")
-        logger.info(f"💰 Taxa de comissão: {COMMISSION_RATE*100}%")
-        
-        if COMMISSION_ADDRESS:
-            logger.info(f"🏦 Carteira comissão: {COMMISSION_ADDRESS[:20]}...")
-        if MERCHANT_ADDRESS:
-            logger.info(f"🏪 Carteira vendedor: {MERCHANT_ADDRESS[:20]}...")
-        
-        logger.info("✅ Bot pronto! Aguardando comandos...")
-        
-        # Iniciar polling
-        self.app.run_polling(allowed_updates=Update.ALL_TYPES)
+            logger.error(f"Erro ao processar cliente {user_id}: {e}")
 
 
 def main():
     """Função principal"""
-    try:
-        bot = LiquidBot()
-        bot.run()
-    except KeyboardInterrupt:
-        logger.info("🛑 Bot interrompido pelo usuário")
-    except Exception as e:
-        logger.error(f"❌ Erro fatal: {e}")
-        raise
+    if not TELEGRAM_TOKEN:
+        raise ValueError("TELEGRAM_TOKEN não configurado!")
+    
+    # Criar aplicação
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Handler de conversa
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            WAITING_DAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_dia)],
+            WAITING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_valor)],
+        },
+        fallbacks=[CommandHandler('cancelar', cancelar_conversa)],
+    )
+    
+    app.add_handler(conv_handler)
+    app.add_handler(CommandHandler('status', status))
+    app.add_handler(CommandHandler('cancelar', cancelar_cobrancas))
+    
+    # Job diário às 9h da manhã
+    app.job_queue.run_daily(
+        verificar_cobrancas_diarias,
+        time=time(hour=9, minute=0),
+        name='cobrancas_diarias'
+    )
+    
+    logger.info("🤖 Bot iniciado!")
+    logger.info(f"💳 Wallet: {WALLET_ADDRESS}")
+    logger.info("✅ Sistema de cobranças automáticas ativo")
+    
+    # Iniciar bot
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == '__main__':
