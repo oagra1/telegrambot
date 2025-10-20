@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Bot Telegram para cobranças automáticas via Atlas DAO
-Fluxo: Configura dia + valor → Gera cobrança automática todo mês
+Bot Telegram para cobranças automáticas
+Sistema limpo e profissional para clientes
 """
 
 import os
@@ -13,11 +13,12 @@ from datetime import datetime, time
 from typing import Dict
 import requests
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
     ConversationHandler
@@ -32,14 +33,14 @@ logger = logging.getLogger(__name__)
 
 # Configurações
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-WALLET_ADDRESS = os.getenv('WALLET_ADDRESS', 'CONFIGURE_WALLET_LWK')
+WALLET_ADDRESS = os.getenv('WALLET_ADDRESS', 'CONFIGURE_WALLET')
 ATLAS_API_KEY = 'atlas_ceaf6237e499f94dfe87ef62b19e25b360293369cbacfdf99760ee255761b5f5'
 ATLAS_API_URL = 'https://api.atlasdao.info/api/v1'
 
 # Estados da conversa
 WAITING_DAY, WAITING_AMOUNT = range(2)
 
-# Arquivo para salvar dados dos usuários
+# Arquivo para salvar dados
 DATA_FILE = 'usuarios.json'
 
 
@@ -50,41 +51,42 @@ class ClienteManager:
         self.clientes: Dict = self.load_data()
     
     def load_data(self) -> Dict:
-        """Carrega dados do arquivo"""
         try:
             if os.path.exists(DATA_FILE):
                 with open(DATA_FILE, 'r') as f:
                     return json.load(f)
             return {}
-        except Exception as e:
-            logger.error(f"Erro ao carregar dados: {e}")
+        except:
             return {}
     
     def save_data(self):
-        """Salva dados no arquivo"""
         try:
             with open(DATA_FILE, 'w') as f:
                 json.dump(self.clientes, f, indent=2)
         except Exception as e:
-            logger.error(f"Erro ao salvar dados: {e}")
+            logger.error(f"Erro ao salvar: {e}")
     
     def add_cliente(self, user_id: int, username: str, dia: int, valor: float):
-        """Adiciona ou atualiza cliente"""
         self.clientes[str(user_id)] = {
             'username': username,
             'dia_pagamento': dia,
             'valor': valor,
             'ativo': True,
-            'ultima_cobranca': None
+            'ultima_cobranca': None,
+            'ultimo_merchant_id': None
         }
         self.save_data()
     
     def get_cliente(self, user_id: int):
-        """Retorna dados do cliente"""
         return self.clientes.get(str(user_id))
     
+    def update_merchant_id(self, user_id: int, merchant_id: str):
+        """Salva último merchant_id gerado"""
+        if str(user_id) in self.clientes:
+            self.clientes[str(user_id)]['ultimo_merchant_id'] = merchant_id
+            self.save_data()
+    
     def get_clientes_do_dia(self, dia: int) -> list:
-        """Retorna clientes que pagam hoje"""
         return [
             (user_id, dados) 
             for user_id, dados in self.clientes.items()
@@ -93,18 +95,41 @@ class ClienteManager:
 
 
 def gerar_merchant_id() -> str:
-    """Gera merchantOrderId aleatório de 10 caracteres"""
-    caracteres = string.ascii_uppercase + string.digits
-    return ''.join(random.choice(caracteres) for _ in range(10))
+    """Gera ID aleatório de 10 caracteres"""
+    return ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(10))
 
 
 def formatar_valor(valor: float) -> float:
-    """Garante formato X.XX"""
+    """Formato X.XX"""
     return round(float(valor), 2)
 
 
+async def verificar_pagamento(merchant_id: str) -> Dict:
+    """Verifica status do pagamento via API"""
+    try:
+        url = f"{ATLAS_API_URL}/external/pix/status/{merchant_id}"
+        headers = {'X-API-Key': ATLAS_API_KEY}
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            # Assumindo que API retorna: {"status": "paid"} ou similar
+            return {
+                'success': True,
+                'paid': data.get('status') == 'paid',
+                'data': data
+            }
+        else:
+            return {'success': False, 'error': 'Erro ao verificar'}
+    
+    except Exception as e:
+        logger.error(f"Erro verificação: {e}")
+        return {'success': False, 'error': str(e)}
+
+
 async def gerar_cobranca(user_id: int, username: str, valor: float, context: ContextTypes.DEFAULT_TYPE) -> Dict:
-    """Gera cobrança via API Atlas DAO"""
+    """Gera cobrança via API"""
     
     merchant_id = gerar_merchant_id()
     valor_formatado = formatar_valor(valor)
@@ -122,70 +147,68 @@ async def gerar_cobranca(user_id: int, username: str, valor: float, context: Con
     }
     
     try:
-        logger.info(f"Gerando cobrança: {payload}")
-        
-        response = requests.post(
-            ATLAS_API_URL,
-            json=payload,
-            headers=headers,
-            timeout=30
-        )
+        response = requests.post(ATLAS_API_URL, json=payload, headers=headers, timeout=30)
         
         if response.status_code == 200:
             data = response.json()
-            logger.info(f"Cobrança gerada com sucesso: {merchant_id}")
             
-            # Enviar cobrança para o usuário
+            # Salvar merchant_id
+            clientes_manager.update_merchant_id(user_id, merchant_id)
+            
+            # Botão para verificar pagamento
+            keyboard = [
+                [InlineKeyboardButton("✅ Realizei o pagamento", callback_data=f"verificar_{merchant_id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            # Mensagem limpa
             mensagem = (
-                f"💰 *Nova Cobrança Gerada*\n\n"
+                f"💰 *Cobrança Gerada*\n\n"
                 f"Valor: R$ {valor_formatado:.2f}\n"
                 f"ID: `{merchant_id}`\n\n"
-                f"Efetue o pagamento usando o QR Code abaixo:"
+                f"Pague usando o QR Code abaixo.\n"
+                f"Após pagar, clique no botão para confirmar."
             )
             
             await context.bot.send_message(
                 chat_id=user_id,
                 text=mensagem,
-                parse_mode='Markdown'
+                parse_mode='Markdown',
+                reply_markup=reply_markup
             )
             
-            # Se a API retornar QR code, enviar
+            # QR Code se disponível
             if 'qrCode' in data:
-                await context.bot.send_photo(
-                    chat_id=user_id,
-                    photo=data['qrCode']
-                )
+                await context.bot.send_photo(chat_id=user_id, photo=data['qrCode'])
             
-            # Se retornar link de pagamento
             if 'paymentUrl' in data:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"🔗 Link de pagamento: {data['paymentUrl']}"
+                    text=f"🔗 {data['paymentUrl']}"
                 )
             
-            return {'success': True, 'merchant_id': merchant_id, 'data': data}
+            return {'success': True, 'merchant_id': merchant_id}
         
         else:
-            logger.error(f"Erro na API: {response.status_code} - {response.text}")
+            logger.error(f"Erro API: {response.text}")
             return {'success': False, 'error': response.text}
     
     except Exception as e:
-        logger.error(f"Erro ao gerar cobrança: {e}")
+        logger.error(f"Erro: {e}")
         return {'success': False, 'error': str(e)}
 
 
-# Instância global do gerenciador
+# Gerenciador global
 clientes_manager = ClienteManager()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Comando /start - Inicia configuração"""
+    """Comando /start"""
     user = update.effective_user
     
     await update.message.reply_text(
-        f"👋 Bem vindo *{user.first_name}*!\n\n"
-        f"Vou configurar sua cobrança automática.\n\n"
-        f"📅 Qual dia do mês você quer pagar? (1-31)",
+        f"Bem vindo, *{user.first_name}*!\n\n"
+        f"📅 Qual dia do mês você deseja pagar?",
         parse_mode='Markdown'
     )
     
@@ -193,178 +216,140 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def receber_dia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe o dia do pagamento"""
+    """Recebe dia"""
     try:
         dia = int(update.message.text.strip())
         
         if dia < 1 or dia > 31:
-            await update.message.reply_text(
-                "❌ Por favor, digite um dia válido entre 1 e 31."
-            )
+            await update.message.reply_text("Por favor, digite um dia entre 1 e 31.")
             return WAITING_DAY
         
-        # Salvar dia temporariamente
         context.user_data['dia'] = dia
         
         await update.message.reply_text(
-            f"✅ Dia {dia} configurado!\n\n"
-            f"💵 Qual o valor da cobrança?\n"
-            f"(Digite apenas o número, até R$ 3000,00)\n"
-            f"Exemplo: 150"
+            f"Perfeito!\n\n"
+            f"💵 Qual o valor?\n"
+            f"(Digite apenas o número, até 3000)"
         )
         
         return WAITING_AMOUNT
     
     except ValueError:
-        await update.message.reply_text(
-            "❌ Por favor, digite apenas números.\n"
-            "Exemplo: 15"
-        )
+        await update.message.reply_text("Por favor, digite apenas números.")
         return WAITING_DAY
 
 
 async def receber_valor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe o valor do pagamento"""
+    """Recebe valor"""
     try:
         valor = float(update.message.text.strip().replace(',', '.'))
         
         if valor <= 0 or valor > 3000:
-            await update.message.reply_text(
-                "❌ Valor inválido! Digite um valor entre R$ 0,01 e R$ 3.000,00"
-            )
+            await update.message.reply_text("Valor inválido. Digite entre 0.01 e 3000")
             return WAITING_AMOUNT
         
-        # Recuperar dados
         dia = context.user_data['dia']
         user = update.effective_user
-        user_id = user.id
-        username = user.first_name or user.username or f"User{user_id}"
+        username = user.first_name or user.username or f"User{user.id}"
         
-        # Salvar cliente
-        clientes_manager.add_cliente(user_id, username, dia, valor)
+        # Salvar
+        clientes_manager.add_cliente(user.id, username, dia, valor)
         
         await update.message.reply_text(
-            f"✅ *Configuração Completa!*\n\n"
-            f"📅 Dia do pagamento: {dia}\n"
-            f"💰 Valor: R$ {valor:.2f}\n\n"
-            f"Todo dia {dia} você receberá uma cobrança automática.\n\n"
-            f"Use /status para ver sua configuração\n"
-            f"Use /cancelar para cancelar cobranças",
+            f"✅ *Configurado com sucesso!*\n\n"
+            f"Todo dia *{dia}* você receberá uma cobrança de *R$ {valor:.2f}*",
             parse_mode='Markdown'
         )
         
-        # Se hoje for o dia, gerar cobrança imediatamente
-        hoje = datetime.now().day
-        if hoje == dia:
-            await update.message.reply_text(
-                "⏰ Hoje é seu dia de pagamento!\n"
-                "Gerando cobrança agora..."
-            )
-            await gerar_cobranca(user_id, username, valor, context)
+        # Se hoje é o dia, cobrar agora
+        if datetime.now().day == dia:
+            await update.message.reply_text("⏰ Gerando sua cobrança...")
+            await gerar_cobranca(user.id, username, valor, context)
         
         return ConversationHandler.END
     
     except ValueError:
-        await update.message.reply_text(
-            "❌ Por favor, digite apenas números.\n"
-            "Exemplo: 150 ou 150.50"
-        )
+        await update.message.reply_text("Por favor, digite apenas números.")
         return WAITING_AMOUNT
 
 
+async def verificar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback do botão 'Realizei o pagamento'"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Extrair merchant_id
+    merchant_id = query.data.replace('verificar_', '')
+    
+    await query.edit_message_text("⏳ Verificando pagamento...")
+    
+    # Verificar na API
+    resultado = await verificar_pagamento(merchant_id)
+    
+    if resultado.get('success') and resultado.get('paid'):
+        # PAGAMENTO CONFIRMADO
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="✅ *Pagamento confirmado!*\n\nObrigado! 🎉",
+            parse_mode='Markdown'
+        )
+    else:
+        # NÃO CONFIRMADO
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text=(
+                "⚠️ Pagamento ainda não confirmado.\n\n"
+                "Se você já pagou, envie o comprovante e "
+                "entre em contato com o suporte."
+            )
+        )
+
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostra status da configuração"""
-    user_id = update.effective_user.id
-    cliente = clientes_manager.get_cliente(user_id)
+    """Ver configuração"""
+    cliente = clientes_manager.get_cliente(update.effective_user.id)
     
     if not cliente:
-        await update.message.reply_text(
-            "❌ Você ainda não configurou cobranças.\n"
-            "Use /start para começar!"
-        )
+        await update.message.reply_text("Você ainda não está configurado.\nUse /start")
         return
     
     await update.message.reply_text(
-        f"📊 *Sua Configuração*\n\n"
-        f"📅 Dia do pagamento: {cliente['dia_pagamento']}\n"
-        f"💰 Valor: R$ {cliente['valor']:.2f}\n"
-        f"✅ Status: {'Ativo' if cliente['ativo'] else 'Cancelado'}\n\n"
-        f"Use /start para reconfigurar\n"
-        f"Use /cancelar para desativar",
+        f"📊 *Sua configuração*\n\n"
+        f"Dia: {cliente['dia_pagamento']}\n"
+        f"Valor: R$ {cliente['valor']:.2f}",
         parse_mode='Markdown'
     )
 
 
-async def cancelar_cobrancas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancela cobranças automáticas"""
-    user_id = update.effective_user.id
-    cliente = clientes_manager.get_cliente(user_id)
-    
-    if not cliente:
-        await update.message.reply_text("❌ Você não tem cobranças configuradas.")
-        return
-    
-    cliente['ativo'] = False
-    clientes_manager.save_data()
-    
-    await update.message.reply_text(
-        "🛑 Cobranças automáticas canceladas.\n\n"
-        "Use /start para reativar."
-    )
-
-
 async def cancelar_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancela a conversa"""
-    await update.message.reply_text(
-        "❌ Configuração cancelada.\n"
-        "Use /start para começar novamente."
-    )
+    """Cancela"""
+    await update.message.reply_text("Configuração cancelada.\nUse /start novamente.")
     return ConversationHandler.END
 
 
 async def verificar_cobrancas_diarias(context: ContextTypes.DEFAULT_TYPE):
-    """Job que roda diariamente para gerar cobranças"""
+    """Job diário - 9h"""
     hoje = datetime.now().day
-    logger.info(f"🔍 Verificando cobranças para o dia {hoje}")
+    logger.info(f"Verificando cobranças dia {hoje}")
     
     clientes_hoje = clientes_manager.get_clientes_do_dia(hoje)
     
-    if not clientes_hoje:
-        logger.info("Nenhuma cobrança para hoje")
-        return
-    
-    logger.info(f"Encontrados {len(clientes_hoje)} clientes para cobrar")
-    
     for user_id, dados in clientes_hoje:
         try:
-            resultado = await gerar_cobranca(
-                int(user_id),
-                dados['username'],
-                dados['valor'],
-                context
-            )
-            
-            if resultado['success']:
-                # Atualizar última cobrança
-                clientes_manager.clientes[user_id]['ultima_cobranca'] = datetime.now().isoformat()
-                clientes_manager.save_data()
-                logger.info(f"✅ Cobrança gerada para {dados['username']}")
-            else:
-                logger.error(f"❌ Erro ao cobrar {dados['username']}: {resultado.get('error')}")
-        
+            await gerar_cobranca(int(user_id), dados['username'], dados['valor'], context)
+            logger.info(f"Cobrança gerada: {dados['username']}")
         except Exception as e:
-            logger.error(f"Erro ao processar cliente {user_id}: {e}")
+            logger.error(f"Erro: {e}")
 
 
 def main():
-    """Função principal"""
+    """Iniciar bot"""
     if not TELEGRAM_TOKEN:
         raise ValueError("TELEGRAM_TOKEN não configurado!")
     
-    # Criar aplicação
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Handler de conversa
+    # Conversa
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -376,20 +361,15 @@ def main():
     
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler('status', status))
-    app.add_handler(CommandHandler('cancelar', cancelar_cobrancas))
+    app.add_handler(CallbackQueryHandler(verificar_callback, pattern='^verificar_'))
     
-    # Job diário às 9h da manhã
+    # Job diário 9h
     app.job_queue.run_daily(
         verificar_cobrancas_diarias,
-        time=time(hour=9, minute=0),
-        name='cobrancas_diarias'
+        time=time(hour=9, minute=0)
     )
     
     logger.info("🤖 Bot iniciado!")
-    logger.info(f"💳 Wallet: {WALLET_ADDRESS}")
-    logger.info("✅ Sistema de cobranças automáticas ativo")
-    
-    # Iniciar bot
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
