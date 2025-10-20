@@ -11,18 +11,27 @@ import string
 import logging
 from datetime import datetime, time
 from typing import Dict
-import requests
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-    ContextTypes,
-    ConversationHandler
-)
+try:
+    import requests
+except ImportError:
+    print("ERRO: requests não instalado!")
+    raise
+
+try:
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram.ext import (
+        Application,
+        CommandHandler,
+        MessageHandler,
+        CallbackQueryHandler,
+        filters,
+        ContextTypes,
+        ConversationHandler
+    )
+except ImportError as e:
+    print(f"ERRO: python-telegram-bot não instalado! {e}")
+    raise
 
 # Logging
 logging.basicConfig(
@@ -31,11 +40,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+print("=" * 50)
+print("🚀 INICIANDO BOT...")
+print("=" * 50)
+
 # Configurações
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-WALLET_ADDRESS = os.getenv('WALLET_ADDRESS', 'CONFIGURE_WALLET')
+WALLET_ADDRESS = os.getenv('WALLET_ADDRESS', 'WALLET_NAO_CONFIGURADA')
 ATLAS_API_KEY = 'atlas_ceaf6237e499f94dfe87ef62b19e25b360293369cbacfdf99760ee255761b5f5'
 ATLAS_API_URL = 'https://api.atlasdao.info/api/v1'
+
+print(f"✅ Token Telegram: {'OK' if TELEGRAM_TOKEN else '❌ FALTANDO'}")
+print(f"✅ Wallet Address: {WALLET_ADDRESS[:20]}..." if len(WALLET_ADDRESS) > 20 else f"⚠️ Wallet: {WALLET_ADDRESS}")
+print(f"✅ API Key: OK")
+print("-" * 50)
 
 # Estados da conversa
 WAITING_DAY, WAITING_AMOUNT = range(2)
@@ -136,7 +154,7 @@ async def gerar_cobranca(user_id: int, username: str, valor: float, context: Con
     
     payload = {
         "amount": valor_formatado,
-        "description": f"Pagamento por {username}",
+        "description": f"Assinatura Mensal OMTB",
         "walletAddress": WALLET_ADDRESS,
         "merchantOrderId": merchant_id
     }
@@ -155,22 +173,31 @@ async def gerar_cobranca(user_id: int, username: str, valor: float, context: Con
             # Salvar merchant_id
             clientes_manager.update_merchant_id(user_id, merchant_id)
             
+            # Pegar chave PIX (assumindo que API retorna isso)
+            chave_pix = data.get('pixKey') or data.get('pixCode') or data.get('brcode') or 'Chave não disponível'
+            qr_code_url = data.get('qrCode') or data.get('qrCodeUrl')
+            
             # Botão para verificar pagamento
             keyboard = [
                 [InlineKeyboardButton("✅ Realizei o pagamento", callback_data=f"verificar_{merchant_id}")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
-            # Mensagem limpa
+            # Mensagem organizada
             mensagem = (
-                f"💰 *Cobrança Gerada*\n\n"
-                f"Valor: R$ {valor_formatado:.2f}\n"
-                f"ID: `{merchant_id}`\n\n"
-                f"Pague usando o QR Code abaixo.\n"
-                f"Após pagar, clique no botão para confirmar."
+                f"📃 *Informações de pagamento*\n"
+                f"Assinatura Mensal OMTB\n\n"
+                f"💰 Valor: R$ {valor_formatado:.2f}\n"
+                f"🆔 ID: `{merchant_id}`\n\n"
+                f"🔑 *Chave PIX (Copia e Cola)*\n"
+                f"```\n{chave_pix}\n```\n\n"
+                f"⚠️ *Atenção!*\n"
+                f"Após o pagamento, toque no botão abaixo.\n\n"
+                f"⏰ Esta cobrança expira em 30 minutos."
             )
             
-            await context.bot.send_message(
+            # Enviar mensagem com botão
+            msg = await context.bot.send_message(
                 chat_id=user_id,
                 text=mensagem,
                 parse_mode='Markdown',
@@ -178,23 +205,36 @@ async def gerar_cobranca(user_id: int, username: str, valor: float, context: Con
             )
             
             # QR Code se disponível
-            if 'qrCode' in data:
-                await context.bot.send_photo(chat_id=user_id, photo=data['qrCode'])
-            
-            if 'paymentUrl' in data:
-                await context.bot.send_message(
+            if qr_code_url:
+                await context.bot.send_photo(
                     chat_id=user_id,
-                    text=f"🔗 {data['paymentUrl']}"
+                    photo=qr_code_url,
+                    caption="📱 Escaneie o QR Code acima ou use a chave PIX"
                 )
+            
+            # Agendar exclusão após 30 minutos
+            context.job_queue.run_once(
+                expirar_cobranca,
+                when=1800,  # 30 minutos em segundos
+                data={'chat_id': user_id, 'message_id': msg.message_id, 'merchant_id': merchant_id}
+            )
             
             return {'success': True, 'merchant_id': merchant_id}
         
         else:
             logger.error(f"Erro API: {response.text}")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="❌ Erro ao gerar cobrança. Tente novamente em instantes."
+            )
             return {'success': False, 'error': response.text}
     
     except Exception as e:
         logger.error(f"Erro: {e}")
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="❌ Erro ao processar pagamento. Contate o suporte."
+        )
         return {'success': False, 'error': str(e)}
 
 
@@ -279,30 +319,77 @@ async def verificar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     
     # Extrair merchant_id
-    merchant_id = query.data.replace('verificar_', '')
+    data_text = query.data
     
-    await query.edit_message_text("⏳ Verificando pagamento...")
-    
-    # Verificar na API
-    resultado = await verificar_pagamento(merchant_id)
-    
-    if resultado.get('success') and resultado.get('paid'):
-        # PAGAMENTO CONFIRMADO
-        await context.bot.send_message(
-            chat_id=query.from_user.id,
-            text="✅ *Pagamento confirmado!*\n\nObrigado! 🎉",
-            parse_mode='Markdown'
-        )
-    else:
-        # NÃO CONFIRMADO
-        await context.bot.send_message(
-            chat_id=query.from_user.id,
-            text=(
-                "⚠️ Pagamento ainda não confirmado.\n\n"
-                "Se você já pagou, envie o comprovante e "
-                "entre em contato com o suporte."
+    if data_text.startswith('verificar_'):
+        merchant_id = data_text.replace('verificar_', '')
+        
+        await query.edit_message_text("⏳ Verificando pagamento...")
+        
+        # Verificar na API
+        resultado = await verificar_pagamento(merchant_id)
+        
+        if resultado.get('success') and resultado.get('paid'):
+            # PAGAMENTO CONFIRMADO
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text="✅ *Pagamento confirmado!*\n\nObrigado! 🎉",
+                parse_mode='Markdown'
             )
-        )
+        else:
+            # NÃO CONFIRMADO
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text=(
+                    "⚠️ Pagamento ainda não confirmado.\n\n"
+                    "Se você já pagou, envie o comprovante e "
+                    "entre em contato com o suporte."
+                )
+            )
+    
+    elif data_text.startswith('novopag_'):
+        # Botão "Fazer pagamento" após expiração
+        merchant_id_antigo = data_text.replace('novopag_', '')
+        user_id = query.from_user.id
+        
+        # Pegar dados do cliente
+        cliente = clientes_manager.get_cliente(user_id)
+        if cliente:
+            await query.edit_message_text("⏳ Gerando nova cobrança...")
+            await gerar_cobranca(user_id, cliente['username'], cliente['valor'], context)
+        else:
+            await query.edit_message_text("❌ Erro. Use /start para configurar novamente.")
+
+
+async def expirar_cobranca(context: ContextTypes.DEFAULT_TYPE):
+    """Função chamada após 30 min para expirar cobrança"""
+    job_data = context.job.data
+    chat_id = job_data['chat_id']
+    message_id = job_data['message_id']
+    merchant_id = job_data['merchant_id']
+    
+    try:
+        # Deletar mensagem antiga
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        logger.warning(f"Não foi possível deletar mensagem: {e}")
+    
+    # Enviar nova mensagem com botão
+    keyboard = [
+        [InlineKeyboardButton("💳 Fazer pagamento", callback_data=f"novopag_{merchant_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "⏰ *Cobrança expirada*\n\n"
+            "O prazo de 30 minutos expirou.\n"
+            "Toque no botão abaixo para gerar um novo pagamento."
+        ),
+        parse_mode='Markdown',
+        reply_markup=reply_markup
+    )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -361,13 +448,20 @@ def main():
     
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler('status', status))
-    app.add_handler(CallbackQueryHandler(verificar_callback, pattern='^verificar_'))
+    app.add_handler(CallbackQueryHandler(verificar_callback))
     
     # Job diário 9h
-    app.job_queue.run_daily(
-        verificar_cobrancas_diarias,
-        time=time(hour=9, minute=0)
-    )
+    try:
+        if app.job_queue:
+            app.job_queue.run_daily(
+                verificar_cobrancas_diarias,
+                time=time(hour=9, minute=0)
+            )
+            logger.info("✅ Job diário configurado")
+        else:
+            logger.warning("⚠️ JobQueue não disponível")
+    except Exception as e:
+        logger.warning(f"⚠️ Não foi possível configurar job diário: {e}")
     
     logger.info("🤖 Bot iniciado!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
