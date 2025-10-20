@@ -1,0 +1,8 @@
+# Bot Telegram
+python-telegram-bot==20.7
+
+# Requisições HTTP
+requests==2.31.0
+
+# Liquid Wallet Kit
+lwk==0.9.1
