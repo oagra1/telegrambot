@@ -1,4 +1,4 @@
-# Bot Telegram COM job-queue
+# Bot Telegram COM job-queue (para agendamentos e timers)
 python-telegram-bot[job-queue]==20.7
 
 # Requisições HTTP
