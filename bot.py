@@ -26,8 +26,7 @@ try:
         MessageHandler,
         CallbackQueryHandler,
         filters,
-        ContextTypes,
-        ConversationHandler
+        ContextTypes
     )
 except ImportError as e:
     print(f"ERRO: python-telegram-bot não instalado! {e}")
@@ -61,11 +60,11 @@ print(f"✅ Wallet Address: {WALLET_ADDRESS[:20]}..." if len(WALLET_ADDRESS) > 2
 print(f"✅ API Key: OK")
 print("-" * 50)
 
-# Estados da conversa
-WAITING_DAY, WAITING_AMOUNT = range(2)
-
 # Arquivo para salvar dados
 DATA_FILE = 'usuarios.json'
+
+# Estados dos usuários
+user_states: Dict[int, str] = {}
 
 
 class ClienteManager:
@@ -183,7 +182,8 @@ async def gerar_cobranca(user_id: int, username: str, valor: float, context: Con
             
             # Botão para verificar pagamento
             keyboard = [
-                [InlineKeyboardButton("✅ Realizei o pagamento", callback_data=f"verificar_{payment_id}")]
+                [InlineKeyboardButton("✅ Realizei o pagamento", callback_data=f"verificar_{payment_id}")],
+                [InlineKeyboardButton("🔙 Voltar pra opção anterior", callback_data='voltar_anterior')]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -264,75 +264,98 @@ async def gerar_cobranca(user_id: int, username: str, valor: float, context: Con
 clientes_manager = ClienteManager()
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /start"""
     user = update.effective_user
-    
+    user_states[user.id] = 'day'
+    context.user_data.pop('dia', None)
+
     await update.message.reply_text(
         f"Bem vindo, *{user.first_name}*!\n\n"
         f"📅 Qual dia do mês você deseja pagar?",
         parse_mode='Markdown'
     )
-    
-    return WAITING_DAY
 
 
-async def receber_dia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def receber_dia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Recebe dia"""
     try:
         dia = int(update.message.text.strip())
-        
+
         if dia < 1 or dia > 31:
             await update.message.reply_text("Por favor, digite um dia entre 1 e 31.")
-            return WAITING_DAY
-        
+            user_states[update.effective_user.id] = 'day'
+            return
+
         context.user_data['dia'] = dia
-        
+        user_states[update.effective_user.id] = 'amount'
+
         await update.message.reply_text(
             f"Perfeito!\n\n"
             f"💵 Qual o valor?\n"
-            f"(Digite apenas o número, até 3000)"
+            f"(Digite apenas o número, até 3000)",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Voltar pra opção anterior", callback_data='voltar_anterior')]
+            ])
         )
-        
-        return WAITING_AMOUNT
-    
+
     except ValueError:
         await update.message.reply_text("Por favor, digite apenas números.")
-        return WAITING_DAY
+        user_states[update.effective_user.id] = 'day'
 
 
-async def receber_valor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def receber_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Recebe valor"""
     try:
         valor = float(update.message.text.strip().replace(',', '.'))
-        
+
         if valor <= 0 or valor > 3000:
             await update.message.reply_text("Valor inválido. Digite entre 0.01 e 3000")
-            return WAITING_AMOUNT
-        
-        dia = context.user_data['dia']
+            user_states[update.effective_user.id] = 'amount'
+            return
+
+        dia = context.user_data.get('dia')
+        if dia is None:
+            await update.message.reply_text("Por favor, informe primeiro o dia de pagamento usando /start.")
+            user_states[update.effective_user.id] = 'day'
+            return
+
         user = update.effective_user
         username = user.first_name or user.username or f"User{user.id}"
-        
+
         # Salvar
         clientes_manager.add_cliente(user.id, username, dia, valor)
-        
+        user_states[user.id] = None
+
         await update.message.reply_text(
             f"✅ *Configurado com sucesso!*\n\n"
             f"Todo dia *{dia}* você receberá uma cobrança de *R$ {valor:.2f}*",
             parse_mode='Markdown'
         )
-        
+
         # Se hoje é o dia, cobrar agora
         if datetime.now().day == dia:
             await update.message.reply_text("⏰ Gerando sua cobrança...")
             await gerar_cobranca(user.id, username, valor, context)
-        
-        return ConversationHandler.END
-    
+
     except ValueError:
         await update.message.reply_text("Por favor, digite apenas números.")
-        return WAITING_AMOUNT
+        user_states[update.effective_user.id] = 'amount'
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processa mensagens de texto conforme o estado do usuário"""
+    user_id = update.effective_user.id
+    estado = user_states.get(user_id)
+
+    if estado == 'day':
+        await receber_dia(update, context)
+    elif estado == 'amount':
+        await receber_valor(update, context)
+    else:
+        await update.message.reply_text(
+            "Use /start para iniciar a configuração ou /pagar para gerar uma cobrança."
+        )
 
 
 async def verificar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -342,6 +365,25 @@ async def verificar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     data_text = query.data
     
+    if data_text == 'voltar_anterior':
+        user_id = query.from_user.id
+        user_states[user_id] = 'day'
+        context.user_data.pop('dia', None)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🔄 Vamos ajustar suas informações.\n\n"
+                "📅 Qual dia do mês você deseja pagar?"
+            ),
+            parse_mode='Markdown'
+        )
+        return
+
     if data_text.startswith('verificar_'):
         payment_id = data_text.replace('verificar_', '')
         
@@ -405,7 +447,8 @@ async def expirar_cobranca(context: ContextTypes.DEFAULT_TYPE):
     
     # Enviar nova mensagem com botão
     keyboard = [
-        [InlineKeyboardButton("💳 Fazer pagamento", callback_data=f"novopag_{payment_id}")]
+        [InlineKeyboardButton("💳 Fazer pagamento", callback_data=f"novopag_{payment_id}")],
+        [InlineKeyboardButton("🔙 Voltar pra opção anterior", callback_data='voltar_anterior')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -437,10 +480,25 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cancelar_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+
+
+async def pagar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gera uma cobrança imediata"""
+    cliente = clientes_manager.get_cliente(update.effective_user.id)
+
+    if not cliente:
+        await update.message.reply_text("Você ainda não está configurado. Use /start para informar os dados.")
+        return
+
+    await update.message.reply_text("⏳ Gerando sua cobrança...")
+    await gerar_cobranca(update.effective_user.id, cliente['username'], cliente['valor'], context)
+
+
+async def cancelar_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancela"""
+    user_states[update.effective_user.id] = None
+    context.user_data.pop('dia', None)
     await update.message.reply_text("Configuração cancelada.\nUse /start novamente.")
-    return ConversationHandler.END
 
 
 async def verificar_cobrancas_diarias(context: ContextTypes.DEFAULT_TYPE):
@@ -465,18 +523,12 @@ def main():
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Conversa
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
-        states={
-            WAITING_DAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_dia)],
-            WAITING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_valor)],
-        },
-        fallbacks=[CommandHandler('cancelar', cancelar_conversa)],
-    )
-    
-    app.add_handler(conv_handler)
+    # Handlers de comandos e mensagens
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('pagar', pagar))
     app.add_handler(CommandHandler('status', status))
+    app.add_handler(CommandHandler('cancelar', cancelar_conversa))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(verificar_callback))
     
     # Job diário 9h
