@@ -656,3 +656,66 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ------ pagar ------
+
+async def pagar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Comando /pagar – gera uma cobrança imediata.
+    Mantém o fluxo atual: mostra 'Gerando cobrança...' e chama gerar_cobranca().
+    """
+    user_id = update.effective_user.id
+    cliente = clientes_manager.get_cliente(user_id)
+
+    if not cliente:
+        await update.message.reply_text("Você ainda não está configurado. Use /start.")
+        return
+
+    await update.message.reply_text("⏳ Gerando cobrança...")
+    await gerar_cobranca(
+        user_id,
+        cliente["username"],
+        cliente["valor"],
+        context,
+        cliente.get("cpf_cnpj")  # se você removeu CPF do fluxo, pode deixar None
+    )
+
+# ---------- menu: /start /pagar /status no botão "Menu" ----------
+
+from telegram import BotCommand
+
+async def _register_bot_commands(app: Application):
+    """
+    Registra os comandos para aparecerem no botão 'Menu' do Telegram.
+    """
+    commands = [
+        BotCommand("start", "Configurar cobrança"),
+        BotCommand("pagar", "Gerar cobrança agora"),
+        BotCommand("status", "Ver meu status"),
+    ]
+    await app.bot.set_my_commands(commands)
+
+# Chame isso no main, após criar a Application:
+# app = Application.builder().token(TELEGRAM_TOKEN).build()
+# app.post_init = _post_init_register_menu
+
+async def _post_init_register_menu(app: Application):
+    await _register_bot_commands(app)
+def main():
+    if not TELEGRAM_TOKEN:
+        raise ValueError("❌ TELEGRAM_TOKEN não configurado!")
+
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("pagar", pagar))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(verificar_callback))
+
+    # <<< importa isso: registra os comandos no botão "Menu"
+    app.post_init = _post_init_register_menu
+
+    logger.info("🤖 Bot iniciado!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
