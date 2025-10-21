@@ -3,14 +3,15 @@
 Bot Telegram para cobranças automáticas via Depix (Atlas DAO)
 - Banner único (QR + texto) numa imagem
 - Botão "Já paguei" com verificação (mensagens se substituem)
-- Sem solicitar CPF ao usuário (taxNumber omitido; usa ATLAS_TAX_NUMBER_DEFAULT se existir)
+- Sem solicitar CPF (taxNumber omitido; usa ATLAS_TAX_NUMBER_DEFAULT se existir)
 - Reenvio automático a cada 2h no dia da cobrança até confirmar pagamento
+- Menu nativo do Telegram (/start, /pagar, /status)
 """
 
 import os
 import json
 import logging
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 from typing import Dict, Optional
 import base64
 import io
@@ -22,7 +23,13 @@ except ImportError:
     raise
 
 try:
-    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+    from telegram import (
+        Update,
+        InlineKeyboardButton,
+        InlineKeyboardMarkup,
+        InputMediaPhoto,
+        BotCommand,
+    )
     from telegram.ext import (
         Application,
         CommandHandler,
@@ -72,33 +79,24 @@ if ATLAS_TAX_NUMBER_DEFAULT:
 print("-" * 50)
 
 DATA_FILE = "usuarios.json"
-user_states: Dict[int, str] = {}
+user_states: Dict[int, str] = {}  # 'day' -> perguntar dia, 'amount' -> valor
 
-# Mensagem mais recente por usuário (para substituir e não poluir o chat)
-last_message_id: Dict[int, int] = {}
-# Último payment_id por usuário (para verificação e reenvio)
-last_payment_id: Dict[int, str] = {}
-# Flag “pago” por ciclo mensal
-paid_flags: Dict[int, bool] = {}
+# Estado de mensagens/controle
+last_message_id: Dict[int, int] = {}   # última mensagem enviada ao user (para substituir)
+last_payment_id: Dict[int, str] = {}   # último payment id
+paid_flags: Dict[int, bool] = {}       # se já confirmou pagamento no ciclo
 
 # --------------------------- Helpers ---------------------------------------
-def limpar_cpf_cnpj(documento: str) -> str:
-    return "".join(filter(str.isdigit, documento or ""))
-
-
 def formatar_valor_brl(valor: float) -> str:
     return f"{valor:.2f}"
 
-
 def try_load_font(size: int):
-    # Tentativas de fontes comuns; se falhar, Pillow usa fonte padrão
     for name in ["Inter.ttf", "Poppins-Regular.ttf", "arial.ttf"]:
         try:
             return ImageFont.truetype(name, size)
         except Exception:
             continue
     return ImageFont.load_default()
-
 
 # --------------------------- Cliente Manager -------------------------------
 class ClienteManager:
@@ -139,7 +137,6 @@ class ClienteManager:
             if c.get("dia_pagamento") == dia and c.get("ativo")
         ]
 
-
 clientes_manager = ClienteManager()
 
 # ------------------------- Banner (imagem única) ---------------------------
@@ -156,10 +153,10 @@ def build_banner(qr_image_b64: str, valor_formatado: str, qr_string: str) -> byt
 
     draw = ImageDraw.Draw(banner)
     font_title = try_load_font(48)
-    font_text = try_load_font(30)
+    font_text  = try_load_font(30)
     font_small = try_load_font(24)
 
-    # Header com “DePix” e etiqueta “Rede: Liquid”
+    # Cabeçalho
     draw.rounded_rectangle((20, 20, W - 20, 220), radius=28, fill=(20, 28, 36, 255))
     draw.text((50, 50), "DePix", fill=(72, 244, 122, 255), font=font_title)
     draw.text((50, 110), "Rede: Liquid", fill=(180, 200, 210, 255), font=font_text)
@@ -216,7 +213,7 @@ async def gerar_cobranca(
         "description": "Assinatura Mensal OMTB",
         "walletAddress": WALLET_ADDRESS,
     }
-    # inclui taxNumber apenas se definido por env (sem perguntar ao usuário)
+    # inclui taxNumber apenas se definido por env
     if ATLAS_TAX_NUMBER_DEFAULT:
         payload["taxNumber"] = ATLAS_TAX_NUMBER_DEFAULT
 
@@ -233,8 +230,8 @@ async def gerar_cobranca(
 
         data = resp.json()
         payment_id = data.get("id")
-        qr_string = data.get("qrCode")
-        qr_image = data.get("qrCodeImage")
+        qr_string  = data.get("qrCode")
+        qr_image   = data.get("qrCodeImage")
 
         if not qr_image or not qr_string or not payment_id:
             await send_or_replace_text(context, user_id, "❌ Resposta inválida da API.")
@@ -242,28 +239,27 @@ async def gerar_cobranca(
 
         # Gera banner único
         banner_bytes = build_banner(qr_image, formatar_valor_brl(valor_formatado), qr_string)
-        caption = " "  # caption mínima; toda info já está dentro da imagem
+        caption = " "  # info está na imagem
 
         # teclado com “Já paguei”
         kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton("✅ Já paguei", callback_data=f"verificar_{payment_id}")]]
         )
 
-        # Substitui mensagem anterior (se houver) por foto
+        # Substitui mensagem anterior (foto)
         await send_or_replace_photo(context, user_id, banner_bytes, caption, kb)
 
         last_payment_id[user_id] = payment_id
         paid_flags[user_id] = False
 
         # Agenda reenvio a cada 2h no dia da cobrança (se solicitado)
-        if schedule_retries:
+        if schedule_retries and context.job_queue:
             name = f"retry_{user_id}"
-            # remove job antigo (se existir) antes de criar outro
             for j in context.job_queue.get_jobs_by_name(name):
                 j.schedule_removal()
             context.job_queue.run_repeating(
                 callback=retry_cobranca_job,
-                interval=2 * 60 * 60,
+                interval=2 * 60 * 60,   # 2h
                 first=2 * 60 * 60,
                 name=name,
                 data={"user_id": user_id},
@@ -278,7 +274,6 @@ async def gerar_cobranca(
 
 # -------------------- Envio substituindo mensagem --------------------------
 async def send_or_replace_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
-    # apaga a última mensagem, se existir
     msg_id = last_message_id.get(chat_id)
     try:
         if msg_id:
@@ -288,12 +283,17 @@ async def send_or_replace_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     m = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
     last_message_id[chat_id] = m.message_id
 
-async def send_or_replace_photo(context: ContextTypes.DEFAULT_TYPE, chat_id: int, photo_bytes: bytes, caption: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
+async def send_or_replace_photo(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    photo_bytes: bytes,
+    caption: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+):
     msg_id = last_message_id.get(chat_id)
     bio = io.BytesIO(photo_bytes); bio.name = "banner.png"
     try:
         if msg_id:
-            # tenta editar a mídia; se falhar, deleta e manda de novo
             await context.bot.edit_message_media(
                 chat_id=chat_id,
                 message_id=msg_id,
@@ -308,42 +308,6 @@ async def send_or_replace_photo(context: ContextTypes.DEFAULT_TYPE, chat_id: int
             pass
     sent = await context.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption, reply_markup=reply_markup)
     last_message_id[chat_id] = sent.message_id
-
-# ------------------------------ Jobs ---------------------------------------
-async def retry_cobranca_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job a cada 2h: se ainda não pago, reenvia a cobrança (novo QR)."""
-    user_id = context.job.data["user_id"]
-    cliente = clientes_manager.get(user_id)
-    if not cliente:
-        # nada pra fazer
-        context.job.schedule_removal()
-        return
-
-    # Se já pago, encerra o job
-    if paid_flags.get(user_id):
-        context.job.schedule_removal()
-        return
-
-    # Se houver payment_id, primeiro verifica
-    pid = last_payment_id.get(user_id)
-    if pid:
-        res = await verificar_pagamento(pid)
-        if res.get("success") and res.get("paid"):
-            paid_flags[user_id] = True
-            # Confirma visualmente e para o job
-            kb = None
-            await send_or_replace_text(context, user_id, "✅ *Pagamento confirmado!*\n\nObrigado! 🎉")
-            context.job.schedule_removal()
-            return
-
-    # Ainda não pago → gera uma nova cobrança (novo payment_id / novo QR)
-    await gerar_cobranca(
-        user_id,
-        clientes_manager.get(user_id)["username"],
-        clientes_manager.get(user_id)["valor"],
-        context,
-        schedule_retries=False,  # job já existe
-    )
 
 # --------------------------- Fluxo de conversa ------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -370,7 +334,7 @@ async def receber_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not (0 < valor <= 3000):
             await send_or_replace_text(context, update.effective_user.id, "Valor inválido.")
             return
-        # Salva cadastro
+
         user = update.effective_user
         dia = context.user_data.get("dia")
         username = user.first_name or user.username or f"User{user.id}"
@@ -382,7 +346,7 @@ async def receber_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Configurado!\nDia: *{dia}*\nValor: *R$ {formatar_valor_brl(valor)}*"
         )
 
-        # Se hoje é o dia, já cobra
+        # Se hoje é o dia, já cobra e agenda retries
         if datetime.now().day == dia:
             await send_or_replace_text(context, user.id, "⏳ Gerando cobrança...")
             await gerar_cobranca(user.id, username, valor, context, schedule_retries=True)
@@ -408,26 +372,31 @@ async def verificar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if data_text.startswith("verificar_"):
         payment_id = data_text.replace("verificar_", "")
+        await send_or_replace_text(context, user_id, "⏳ Verificando pagamento na rede...")
+
         res = await verificar_pagamento(payment_id)
 
         if res.get("success") and res.get("paid"):
             paid_flags[user_id] = True
             # cancela o job de retry, se houver
-            for j in context.job_queue.get_jobs_by_name(f"retry_{user_id}"):
-                j.schedule_removal()
+            if context.job_queue:
+                for j in context.job_queue.get_jobs_by_name(f"retry_{user_id}"):
+                    j.schedule_removal()
 
-            # substitui mensagem por confirmação (sem botão)
-            await send_or_replace_text(context, user_id, "✅ *Pagamento confirmado!*\n\nObrigado! 🎉")
+            await send_or_replace_text(
+                context,
+                user_id,
+                "✅ *Pagamento confirmado!*\n\nObrigado! Sua próxima cobrança virá no mês seguinte.",
+            )
         else:
-            # Não pago → mantém botão, com instruções
-            texto = ("⚠️ *Pagamento não localizado.*\n\n"
+            # Não pago → mantém botão e orienta
+            texto = ("❌ *Pagamento não localizado.*\n\n"
                      "Se isso for um erro, contate o suporte e envie seu comprovante.\n"
-                     "Caso não tenha efetuado o pagamento, realize-o e toque novamente no botão.")
-            # Reanexa o mesmo botão de verificação
+                     "Caso não tenha efetuado o pagamento, realize-o e toque novamente em *Já paguei*.")
             kb = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("✅ Já paguei", callback_data=f"verificar_{payment_id}")]]
             )
-            # Em vez de só texto, se existir uma imagem anterior, edita legenda; se não, substitui por texto
+            # tenta editar legenda da imagem; se não der, manda texto
             msg_id = last_message_id.get(user_id)
             try:
                 if msg_id:
@@ -440,195 +409,92 @@ async def verificar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await send_or_replace_text(context, user_id, texto)
 
 # ------------------------------- Comandos -----------------------------------
-
-# Cache simples para substituição de mensagens e controle de jobs
-last_msg_ids: Dict[int, int] = {}
-recurring_jobs: Dict[int, "Job"] = {}  # armazenamos o job de cobrança recorrente por usuário
-
-
-async def _delete_previous_and_send_text(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    text: str,
-    reply_markup: Optional[InlineKeyboardMarkup] = None,
-    parse_mode: Optional[str] = "Markdown"
-):
-    """Apaga a última mensagem enviada ao usuário (se existir) e envia uma nova."""
-    old_id = last_msg_ids.get(chat_id)
-    if old_id:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=old_id)
-        except Exception:
-            pass
-    msg = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
-    last_msg_ids[chat_id] = msg.message_id
-    return msg
-
-
-async def _delete_previous_and_send_photo(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    photo_bytes: io.BytesIO,
-    caption: Optional[str] = None,
-    reply_markup: Optional[InlineKeyboardMarkup] = None,
-    parse_mode: Optional[str] = "Markdown"
-):
-    """Apaga a última mensagem e envia uma foto (banner + QR)."""
-    old_id = last_msg_ids.get(chat_id)
-    if old_id:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=old_id)
-        except Exception:
-            pass
-    msg = await context.bot.send_photo(chat_id=chat_id, photo=photo_bytes, caption=caption, reply_markup=reply_markup, parse_mode=parse_mode)
-    last_msg_ids[chat_id] = msg.message_id
-    return msg
-
-
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostra status do cadastro e próxima cobrança."""
-    cliente = clientes_manager.get_cliente(update.effective_user.id)
+    """Mostra status do cadastro e próxima cobrança provável."""
+    cliente = clientes_manager.get(update.effective_user.id)
     if not cliente:
-        await _delete_previous_and_send_text(context, update.effective_user.id, "Você ainda não está configurado. Use /start.")
+        await send_or_replace_text(context, update.effective_user.id, "Você ainda não está configurado. Use /start.")
         return
 
     hoje = datetime.now()
-    prox_mes = (hoje.month % 12) + 1
-    ano = hoje.year + (1 if prox_mes == 1 else 0)
-    proxima_data = datetime(ano, prox_mes if hoje.day > cliente["dia_pagamento"] else hoje.month, cliente["dia_pagamento"])
+    dia = cliente["dia_pagamento"]
+    proximo_mes = hoje.month if hoje.day <= dia else (1 if hoje.month == 12 else hoje.month + 1)
+    ano = hoje.year + (1 if (hoje.month == 12 and hoje.day > dia) else 0)
     txt = (
         f"📊 *Seu cadastro*\n"
-        f"- Dia da cobrança: *{cliente['dia_pagamento']}*\n"
+        f"- Dia da cobrança: *{dia}*\n"
         f"- Valor: *R$ {cliente['valor']:.2f}*\n"
-        f"- Próxima execução: *{proxima_data.strftime('%d/%m/%Y')}*\n"
+        f"- Próxima cobrança: *{dia:02d}/{proximo_mes:02d}/{ano}*\n"
     )
-    await _delete_previous_and_send_text(context, update.effective_user.id, txt)
-
+    await send_or_replace_text(context, update.effective_user.id, txt)
 
 async def pagar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gera cobrança manual (substitui mensagens)."""
+    """/pagar – gera uma cobrança imediata (substituindo mensagens)."""
     user_id = update.effective_user.id
-    cliente = clientes_manager.get_cliente(user_id)
+    cliente = clientes_manager.get(user_id)
     if not cliente:
-        await _delete_previous_and_send_text(context, user_id, "Use /start para configurar primeiro.")
+        await send_or_replace_text(context, user_id, "Você ainda não está configurado. Use /start.")
         return
 
-    # Mensagem de loading substituindo anterior
-    await _delete_previous_and_send_text(context, user_id, "⏳ Gerando cobrança...")
+    await send_or_replace_text(context, user_id, "⏳ Gerando cobrança...")
+    await gerar_cobranca(user_id, cliente["username"], cliente["valor"], context, schedule_retries=True)
 
-    # Chama a função existente que já gera a cobrança (texto + imagem).
-    # Observação: se quiser que APENAS UMA mensagem apareça, adapte sua `gerar_cobranca`
-    # para retornar o banner pronto e use `_delete_previous_and_send_photo` para enviar.
-    await gerar_cobranca(user_id, cliente["username"], cliente["valor"], context, cliente.get("cpf_cnpj"))
-
-
-# ---------- CALLBACKS (botão "Já paguei") ----------
-
-async def verificar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Verifica pagamento quando o usuário clica em 'Já paguei'."""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    chat_id = query.from_user.id
-
-    if data.startswith("verificar_"):
-        payment_id = data.replace("verificar_", "")
-
-        # feedback imediato (substitui)
-        try:
-            # Deleta a mensagem do botão e manda o "verificando..."
-            await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
-        except Exception:
-            pass
-
-        await _delete_previous_and_send_text(context, chat_id, "⏳ Verificando pagamento na rede...")
-
-        # Chama a função de verificação
-        resultado = await verificar_pagamento(payment_id)
-
-        if resultado.get("success") and resultado.get("paid"):
-            # ✅ Pago: cancela cobrança recorrente (se existir) e confirma
-            job = recurring_jobs.pop(chat_id, None)
-            if job:
-                try:
-                    job.schedule_removal()
-                except Exception:
-                    pass
-
-            await _delete_previous_and_send_text(
-                context,
-                chat_id,
-                "✅ *Pagamento confirmado!*\n\nObrigado! Sua próxima cobrança virá no mês seguinte.",
-            )
-        else:
-            # ❌ Não pago: mensagem que você pediu, e mantemos o job recorrente ativo
-            await _delete_previous_and_send_text(
-                context,
-                chat_id,
-                "❌ *Pagamento não localizado.*\n\n"
-                "Se isso for um erro, contate o suporte com seu comprovante.\n"
-                "Caso não tenha efetuado o pagamento, realize-o e toque novamente em *Já paguei*."
-            )
-
-
-# ---------- JOBS (cobrança a cada 2h no dia da cobrança) ----------
-
-async def _job_cobrar_2h(context: ContextTypes.DEFAULT_TYPE):
-    """Job que roda a cada 2h e gera a cobrança se hoje for o dia do cliente."""
-    now = datetime.now()
-    user_id: int = context.job.data["user_id"]
-    cliente = clientes_manager.get_cliente(user_id)
+# ------------------------------ Jobs ---------------------------------------
+async def retry_cobranca_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job a cada 2h: se ainda não pago, reenvia a cobrança (novo QR)."""
+    user_id = context.job.data["user_id"]
+    cliente = clientes_manager.get(user_id)
     if not cliente:
-        # nada para fazer, remove job
-        job = recurring_jobs.pop(user_id, None)
-        if job:
-            try:
-                job.schedule_removal()
-            except Exception:
-                pass
+        context.job.schedule_removal()
         return
 
-    # Se não é o dia combinado, encerra o job (para não ficar rodando fora do dia)
-    if now.day != int(cliente["dia_pagamento"]):
-        job = recurring_jobs.pop(user_id, None)
-        if job:
-            try:
-                job.schedule_removal()
-            except Exception:
-                pass
+    # Se já pago, encerra o job
+    if paid_flags.get(user_id):
+        context.job.schedule_removal()
         return
 
-    # Envia a cobrança (substituindo mensagem anterior com um aviso rápido antes)
-    await _delete_previous_and_send_text(context, user_id, "⏳ Gerando cobrança...")
-    await gerar_cobranca(user_id, cliente["username"], cliente["valor"], context, cliente.get("cpf_cnpj"))
+    # Se houver payment_id, primeiro verifica
+    pid = last_payment_id.get(user_id)
+    if pid:
+        res = await verificar_pagamento(pid)
+        if res.get("success") and res.get("paid"):
+            paid_flags[user_id] = True
+            await send_or_replace_text(context, user_id, "✅ *Pagamento confirmado!*\n\nObrigado! 🎉")
+            context.job.schedule_removal()
+            return
 
+    # Ainda não pago → gera uma nova cobrança (novo payment_id / novo QR)
+    await gerar_cobranca(
+        user_id,
+        cliente["username"],
+        cliente["valor"],
+        context,
+        schedule_retries=False,  # job já existe
+    )
 
 async def preparar_cobrancas_do_dia(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Roda diariamente e inicia (se ainda não existir) um job a cada 2h
-    para todos os clientes cujo dia_pagamento é hoje.
-    """
+    """Roda diariamente e inicia (se ainda não existir) job a cada 2h para quem cobra hoje."""
     hoje = datetime.now().day
-    clientes_hoje = clientes_manager.get_clientes_do_dia(hoje)
+    for uid, dados in clientes_manager.get_clientes_do_dia(hoje):
+        name = f"retry_{uid}"
+        if context.job_queue.get_jobs_by_name(name):
+            continue
+        # dispara já e repete a cada 2h
+        await gerar_cobranca(uid, dados["username"], dados["valor"], context, schedule_retries=True)
 
-    for uid, dados in clientes_hoje:
-        uid_int = int(uid)
-        if uid_int in recurring_jobs:
-            continue  # já existe job recorrente hoje
+# ------------------------------ Menu (botão) --------------------------------
+async def _register_bot_commands(app: Application):
+    commands = [
+        BotCommand("start", "Configurar cobrança"),
+        BotCommand("pagar", "Gerar cobrança agora"),
+        BotCommand("status", "Ver meu status"),
+    ]
+    await app.bot.set_my_commands(commands)
 
-        # cria job repetindo a cada 2h, primeira execução imediata
-        job = context.job_queue.run_repeating(
-            _job_cobrar_2h,
-            interval=2 * 60 * 60,  # 2h
-            first=0,               # dispara agora
-            data={"user_id": uid_int},
-            name=f"cobranca_{uid_int}"
-        )
-        recurring_jobs[uid_int] = job
+async def _post_init_register_menu(app: Application):
+    await _register_bot_commands(app)
 
-
-# ---------- MAIN (registrando handlers e jobs) ----------
-
+# ------------------------------ MAIN ---------------------------------------
 def main():
     if not TELEGRAM_TOKEN:
         raise ValueError("❌ TELEGRAM_TOKEN não configurado!")
@@ -637,85 +503,22 @@ def main():
 
     # Comandos
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("pagar", pagar))
+    app.add_handler(CommandHandler("status", status))
 
-    # Texto genérico
+    # Texto genérico e callbacks
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    # Callback de botão "Já paguei"
     app.add_handler(CallbackQueryHandler(verificar_callback))
 
-    # Job diário para preparar as cobranças do dia (8h da manhã)
+    # Menu do Telegram
+    app.post_init = _post_init_register_menu
+
+    # Job diário (8h) para iniciar as cobranças de quem vence hoje
     if app.job_queue:
         app.job_queue.run_daily(preparar_cobrancas_do_dia, time=time(hour=8, minute=0, second=0))
 
     logger.info("🤖 Bot iniciado!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-
 if __name__ == "__main__":
     main()
-
-# ------ pagar ------
-
-async def pagar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Comando /pagar – gera uma cobrança imediata.
-    Mantém o fluxo atual: mostra 'Gerando cobrança...' e chama gerar_cobranca().
-    """
-    user_id = update.effective_user.id
-    cliente = clientes_manager.get_cliente(user_id)
-
-    if not cliente:
-        await update.message.reply_text("Você ainda não está configurado. Use /start.")
-        return
-
-    await update.message.reply_text("⏳ Gerando cobrança...")
-    await gerar_cobranca(
-        user_id,
-        cliente["username"],
-        cliente["valor"],
-        context,
-        cliente.get("cpf_cnpj")  # se você removeu CPF do fluxo, pode deixar None
-    )
-
-# ---------- menu: /start /pagar /status no botão "Menu" ----------
-
-from telegram import BotCommand
-
-async def _register_bot_commands(app: Application):
-    """
-    Registra os comandos para aparecerem no botão 'Menu' do Telegram.
-    """
-    commands = [
-        BotCommand("start", "Configurar cobrança"),
-        BotCommand("pagar", "Gerar cobrança agora"),
-        BotCommand("status", "Ver meu status"),
-    ]
-    await app.bot.set_my_commands(commands)
-
-# Chame isso no main, após criar a Application:
-# app = Application.builder().token(TELEGRAM_TOKEN).build()
-# app.post_init = _post_init_register_menu
-
-async def _post_init_register_menu(app: Application):
-    await _register_bot_commands(app)
-def main():
-    if not TELEGRAM_TOKEN:
-        raise ValueError("❌ TELEGRAM_TOKEN não configurado!")
-
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("pagar", pagar))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(CallbackQueryHandler(verificar_callback))
-
-    # <<< importa isso: registra os comandos no botão "Menu"
-    app.post_init = _post_init_register_menu
-
-    logger.info("🤖 Bot iniciado!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
