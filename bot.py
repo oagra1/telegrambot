@@ -8,7 +8,7 @@ import os
 import json
 import logging
 from datetime import datetime, time
-from typing import Dict
+from typing import Dict, Optional
 import base64
 import io
 
@@ -26,8 +26,7 @@ try:
         MessageHandler,
         CallbackQueryHandler,
         filters,
-        ContextTypes,
-        ConversationHandler
+        ContextTypes
     )
 except ImportError as e:
     print(f"ERRO: python-telegram-bot não instalado! {e}")
@@ -61,11 +60,26 @@ print(f"✅ Wallet Address: {WALLET_ADDRESS[:20]}..." if len(WALLET_ADDRESS) > 2
 print(f"✅ API Key: OK")
 print("-" * 50)
 
-# Estados da conversa
-WAITING_DAY, WAITING_AMOUNT = range(2)
-
 # Arquivo para salvar dados
 DATA_FILE = 'usuarios.json'
+
+# Estados dos usuários
+user_states: Dict[int, str] = {}
+
+
+def limpar_cpf_cnpj(documento: str) -> str:
+    """Remove caracteres não numéricos"""
+    return ''.join(filter(str.isdigit, documento or ''))
+
+
+def formatar_cpf_cnpj(documento: str) -> str:
+    """Formata CPF/CNPJ para exibição"""
+    doc = limpar_cpf_cnpj(documento)
+    if len(doc) == 11:
+        return f"{doc[:3]}.{doc[3:6]}.{doc[6:9]}-{doc[9:]}"
+    if len(doc) == 14:
+        return f"{doc[:2]}.{doc[2:5]}.{doc[5:8]}/{doc[8:12]}-{doc[12:]}"
+    return doc
 
 
 class ClienteManager:
@@ -90,7 +104,8 @@ class ClienteManager:
         except Exception as e:
             logger.error(f"Erro ao salvar: {e}")
     
-    def add_cliente(self, user_id: int, username: str, dia: int, valor: float):
+    def add_cliente(self, user_id: int, username: str, dia: int, valor: float, cpf_cnpj: str):
+        documento = limpar_cpf_cnpj(cpf_cnpj)
         self.clientes[str(user_id)] = {
             'username': username,
             'dia_pagamento': dia,
@@ -98,12 +113,16 @@ class ClienteManager:
             'ativo': True,
             'ultima_cobranca': None,
             'ultimo_payment_id': None,
-            'ultimo_merchant_id': None
+            'ultimo_merchant_id': None,
+            'cpf_cnpj': documento
         }
         self.save_data()
-    
+
     def get_cliente(self, user_id: int):
-        return self.clientes.get(str(user_id))
+        cliente = self.clientes.get(str(user_id))
+        if cliente and 'cpf_cnpj' not in cliente:
+            cliente['cpf_cnpj'] = None
+        return cliente
     
     def update_payment_id(self, user_id: int, payment_id: str, merchant_id: str):
         """Salva IDs do pagamento"""
@@ -149,15 +168,38 @@ async def verificar_pagamento(payment_id: str) -> Dict:
         return {'success': False, 'error': str(e)}
 
 
-async def gerar_cobranca(user_id: int, username: str, valor: float, context: ContextTypes.DEFAULT_TYPE) -> Dict:
+async def gerar_cobranca(
+    user_id: int,
+    username: str,
+    valor: float,
+    context: ContextTypes.DEFAULT_TYPE,
+    tax_number: Optional[str] = None
+) -> Dict:
     """Gera cobrança via API Depix"""
-    
+
     valor_formatado = formatar_valor(valor)
-    
+
+    if not tax_number:
+        cliente = clientes_manager.get_cliente(user_id)
+        if cliente:
+            tax_number = cliente.get('cpf_cnpj')
+
+    tax_number = limpar_cpf_cnpj(tax_number or '')
+
+    if not tax_number:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "❌ Informação ausente. Não foi possível gerar a cobrança porque o CPF/CNPJ não "
+                "foi informado. Use /start para configurar novamente."
+            )
+        )
+        return {'success': False, 'error': 'cpf_cnpj ausente'}
+
     payload = {
         "amount": valor_formatado,
         "description": "Assinatura Mensal OMTB",
-        "taxNumber": "",
+        "taxNumber": tax_number,
         "walletAddress": WALLET_ADDRESS
     }
     
@@ -183,7 +225,8 @@ async def gerar_cobranca(user_id: int, username: str, valor: float, context: Con
             
             # Botão para verificar pagamento
             keyboard = [
-                [InlineKeyboardButton("✅ Realizei o pagamento", callback_data=f"verificar_{payment_id}")]
+                [InlineKeyboardButton("✅ Realizei o pagamento", callback_data=f"verificar_{payment_id}")],
+                [InlineKeyboardButton("🔙 Voltar pra opção anterior", callback_data='voltar_anterior')]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -264,75 +307,137 @@ async def gerar_cobranca(user_id: int, username: str, valor: float, context: Con
 clientes_manager = ClienteManager()
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /start"""
     user = update.effective_user
-    
+    user_states[user.id] = 'day'
+    context.user_data.pop('dia', None)
+    context.user_data.pop('valor', None)
+    context.user_data.pop('cpf_cnpj', None)
+
     await update.message.reply_text(
         f"Bem vindo, *{user.first_name}*!\n\n"
         f"📅 Qual dia do mês você deseja pagar?",
         parse_mode='Markdown'
     )
-    
-    return WAITING_DAY
 
 
-async def receber_dia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def receber_dia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Recebe dia"""
     try:
         dia = int(update.message.text.strip())
-        
+
         if dia < 1 or dia > 31:
             await update.message.reply_text("Por favor, digite um dia entre 1 e 31.")
-            return WAITING_DAY
-        
+            user_states[update.effective_user.id] = 'day'
+            return
+
         context.user_data['dia'] = dia
-        
+        user_states[update.effective_user.id] = 'amount'
+
         await update.message.reply_text(
             f"Perfeito!\n\n"
             f"💵 Qual o valor?\n"
-            f"(Digite apenas o número, até 3000)"
+            f"(Digite apenas o número, até 3000)",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Voltar pra opção anterior", callback_data='voltar_day')]
+            ])
         )
-        
-        return WAITING_AMOUNT
-    
+
     except ValueError:
         await update.message.reply_text("Por favor, digite apenas números.")
-        return WAITING_DAY
+        user_states[update.effective_user.id] = 'day'
 
 
-async def receber_valor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def receber_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Recebe valor"""
     try:
         valor = float(update.message.text.strip().replace(',', '.'))
-        
+
         if valor <= 0 or valor > 3000:
             await update.message.reply_text("Valor inválido. Digite entre 0.01 e 3000")
-            return WAITING_AMOUNT
-        
-        dia = context.user_data['dia']
-        user = update.effective_user
-        username = user.first_name or user.username or f"User{user.id}"
-        
-        # Salvar
-        clientes_manager.add_cliente(user.id, username, dia, valor)
-        
+            user_states[update.effective_user.id] = 'amount'
+            return
+
+        dia = context.user_data.get('dia')
+        if dia is None:
+            await update.message.reply_text("Por favor, informe primeiro o dia de pagamento usando /start.")
+            user_states[update.effective_user.id] = 'day'
+            return
+
+        context.user_data['valor'] = valor
+        user_states[update.effective_user.id] = 'tax'
+
         await update.message.reply_text(
-            f"✅ *Configurado com sucesso!*\n\n"
-            f"Todo dia *{dia}* você receberá uma cobrança de *R$ {valor:.2f}*",
-            parse_mode='Markdown'
+            "Ótimo!\n\n"
+            "Informe o CPF ou CNPJ do pagador (apenas números).",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Voltar pra opção anterior", callback_data='voltar_amount')]
+            ])
         )
-        
-        # Se hoje é o dia, cobrar agora
-        if datetime.now().day == dia:
-            await update.message.reply_text("⏰ Gerando sua cobrança...")
-            await gerar_cobranca(user.id, username, valor, context)
-        
-        return ConversationHandler.END
-    
+
     except ValueError:
         await update.message.reply_text("Por favor, digite apenas números.")
-        return WAITING_AMOUNT
+        user_states[update.effective_user.id] = 'amount'
+
+
+async def receber_cpf_cnpj(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recebe CPF/CNPJ"""
+    documento = limpar_cpf_cnpj(update.message.text)
+
+    if len(documento) not in (11, 14):
+        await update.message.reply_text(
+            "Documento inválido. Informe um CPF (11 dígitos) ou CNPJ (14 dígitos)."
+        )
+        user_states[update.effective_user.id] = 'tax'
+        return
+
+    dia = context.user_data.get('dia')
+    valor = context.user_data.get('valor')
+
+    if dia is None or valor is None:
+        await update.message.reply_text(
+            "Informações incompletas. Use /start para configurar novamente."
+        )
+        user_states[update.effective_user.id] = None
+        return
+
+    user = update.effective_user
+    username = user.first_name or user.username or f"User{user.id}"
+
+    clientes_manager.add_cliente(user.id, username, dia, valor, documento)
+    user_states[user.id] = None
+
+    for chave in ('dia', 'valor', 'cpf_cnpj'):
+        context.user_data.pop(chave, None)
+
+    await update.message.reply_text(
+        "✅ *Configurado com sucesso!*\n\n"
+        f"Todo dia *{dia}* você receberá uma cobrança de *R$ {valor:.2f}*.\n"
+        f"Documento cadastrado: `{formatar_cpf_cnpj(documento)}`",
+        parse_mode='Markdown'
+    )
+
+    if datetime.now().day == dia:
+        await update.message.reply_text("⏰ Gerando sua cobrança...")
+        await gerar_cobranca(user.id, username, valor, context, tax_number=documento)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processa mensagens de texto conforme o estado do usuário"""
+    user_id = update.effective_user.id
+    estado = user_states.get(user_id)
+
+    if estado == 'day':
+        await receber_dia(update, context)
+    elif estado == 'amount':
+        await receber_valor(update, context)
+    elif estado == 'tax':
+        await receber_cpf_cnpj(update, context)
+    else:
+        await update.message.reply_text(
+            "Use /start para iniciar a configuração ou /pagar para gerar uma cobrança."
+        )
 
 
 async def verificar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -342,6 +447,70 @@ async def verificar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     data_text = query.data
     
+    if data_text in {'voltar_day', 'voltar_amount', 'voltar_anterior'}:
+        user_id = query.from_user.id
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        if data_text == 'voltar_day':
+            user_states[user_id] = 'day'
+            context.user_data.pop('dia', None)
+            context.user_data.pop('valor', None)
+            context.user_data.pop('cpf_cnpj', None)
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "🔄 Vamos ajustar suas informações.\n\n"
+                    "📅 Qual dia do mês você deseja pagar?"
+                ),
+                parse_mode='Markdown'
+            )
+            return
+
+        if data_text == 'voltar_amount':
+            dia = context.user_data.get('dia')
+            if dia is None:
+                user_states[user_id] = 'day'
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        "Não encontrei o dia cadastrado.\n"
+                        "Por favor, informe novamente usando /start."
+                    )
+                )
+                return
+
+            user_states[user_id] = 'amount'
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "Sem problemas!\n\n"
+                    "💵 Qual o valor?\n"
+                    "(Digite apenas o número, até 3000)"
+                ),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Voltar pra opção anterior", callback_data='voltar_day')]
+                ])
+            )
+            return
+
+        # voltar_anterior vindo de outras telas
+        user_states[user_id] = 'day'
+        context.user_data.pop('dia', None)
+        context.user_data.pop('valor', None)
+        context.user_data.pop('cpf_cnpj', None)
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🔄 Vamos ajustar suas informações.\n\n"
+                "📅 Qual dia do mês você deseja pagar?"
+            ),
+            parse_mode='Markdown'
+        )
+        return
+
     if data_text.startswith('verificar_'):
         payment_id = data_text.replace('verificar_', '')
         
@@ -385,7 +554,13 @@ async def verificar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         cliente = clientes_manager.get_cliente(user_id)
         if cliente:
             await query.edit_message_text("⏳ Gerando nova cobrança...")
-            await gerar_cobranca(user_id, cliente['username'], cliente['valor'], context)
+            await gerar_cobranca(
+                user_id,
+                cliente['username'],
+                cliente['valor'],
+                context,
+                tax_number=cliente.get('cpf_cnpj')
+            )
         else:
             await query.edit_message_text("❌ Erro. Use /start para configurar novamente.")
 
@@ -405,7 +580,8 @@ async def expirar_cobranca(context: ContextTypes.DEFAULT_TYPE):
     
     # Enviar nova mensagem com botão
     keyboard = [
-        [InlineKeyboardButton("💳 Fazer pagamento", callback_data=f"novopag_{payment_id}")]
+        [InlineKeyboardButton("💳 Fazer pagamento", callback_data=f"novopag_{payment_id}")],
+        [InlineKeyboardButton("🔙 Voltar pra opção anterior", callback_data='voltar_anterior')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -432,15 +608,43 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📊 *Sua configuração*\n\n"
         f"Dia: {cliente['dia_pagamento']}\n"
-        f"Valor: R$ {cliente['valor']:.2f}",
+        f"Valor: R$ {cliente['valor']:.2f}\n"
+        f"Documento: {formatar_cpf_cnpj(cliente.get('cpf_cnpj', '')) or 'Não informado'}",
         parse_mode='Markdown'
     )
 
 
-async def cancelar_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+
+
+async def pagar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gera uma cobrança imediata"""
+    cliente = clientes_manager.get_cliente(update.effective_user.id)
+
+    if not cliente:
+        await update.message.reply_text("Você ainda não está configurado. Use /start para informar os dados.")
+        return
+
+    if not cliente.get('cpf_cnpj'):
+        await update.message.reply_text(
+            "Seu cadastro está sem CPF/CNPJ. Use /start para atualizar as informações antes de gerar uma cobrança."
+        )
+        return
+
+    await update.message.reply_text("⏳ Gerando sua cobrança...")
+    await gerar_cobranca(
+        update.effective_user.id,
+        cliente['username'],
+        cliente['valor'],
+        context,
+        tax_number=cliente.get('cpf_cnpj')
+    )
+
+
+async def cancelar_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancela"""
+    user_states[update.effective_user.id] = None
+    context.user_data.pop('dia', None)
     await update.message.reply_text("Configuração cancelada.\nUse /start novamente.")
-    return ConversationHandler.END
 
 
 async def verificar_cobrancas_diarias(context: ContextTypes.DEFAULT_TYPE):
@@ -452,7 +656,13 @@ async def verificar_cobrancas_diarias(context: ContextTypes.DEFAULT_TYPE):
     
     for user_id, dados in clientes_hoje:
         try:
-            await gerar_cobranca(int(user_id), dados['username'], dados['valor'], context)
+            await gerar_cobranca(
+                int(user_id),
+                dados['username'],
+                dados['valor'],
+                context,
+                tax_number=dados.get('cpf_cnpj')
+            )
             logger.info(f"Cobrança gerada: {dados['username']}")
         except Exception as e:
             logger.error(f"Erro: {e}")
@@ -465,18 +675,12 @@ def main():
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Conversa
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
-        states={
-            WAITING_DAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_dia)],
-            WAITING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_valor)],
-        },
-        fallbacks=[CommandHandler('cancelar', cancelar_conversa)],
-    )
-    
-    app.add_handler(conv_handler)
+    # Handlers de comandos e mensagens
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('pagar', pagar))
     app.add_handler(CommandHandler('status', status))
+    app.add_handler(CommandHandler('cancelar', cancelar_conversa))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(verificar_callback))
     
     # Job diário 9h
