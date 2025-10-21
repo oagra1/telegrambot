@@ -3,3 +3,6 @@ python-telegram-bot[job-queue]==20.7
 
 # Requisições HTTP
 requests==2.31.0
+
+# Processamento de imagens (para QR Code base64)
+Pillow==10.1.0
