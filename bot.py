@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv(
     "WALLET_ADDRESS",
-    "lq1qqw3nx0darshqqzl8t95j0vj3xxuwmp4a4fyz799plu7m8d4ztr2jugftryer3khq0jmskgppe6ughwyevgwmuvq8de75sgyy2",
+    "tlq1qq2g846p84385rx45kenwt95kn49tl6ggt09mylannx9y3skhn9q06pnezg4z6sjzahg6nxmafy4klg7xcxnnkape4myr56z2c",
 )
 ATLAS_API_KEY = os.getenv(
     "ATLAS_API_KEY",
