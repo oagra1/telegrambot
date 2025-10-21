@@ -2,8 +2,9 @@
 """
 Bot Telegram para cobranças automáticas via Depix (Atlas DAO)
 - Banner único (QR + texto) numa imagem
-- Botão "Já paguei" com verificação (mensagens se substituem)
-- Sem solicitar CPF (taxNumber omitido; usa ATLAS_TAX_NUMBER_DEFAULT se existir)
+- Botão "Já paguei" com verificação + "Voltar para opção anterior"
+- Solicita CPF/CNPJ apenas se necessário (ordem: env -> cadastro -> perguntar)
+- Mensagens se substituem (não polui o chat)
 - Reenvio automático a cada 2h no dia da cobrança até confirmar pagamento
 - Menu nativo do Telegram (/start, /pagar, /status)
 """
@@ -67,26 +68,29 @@ WALLET_ADDRESS = os.getenv(
 ATLAS_API_KEY = os.getenv("ATLAS_API_KEY", "atlas_ceaf6237e499f94dfe87ef62b19e25b360293369cbacfdf99760ee255761b5f5")
 ATLAS_API_CREATE = "https://api.atlasdao.info/api/v1/external/pix/create"
 ATLAS_API_STATUS = "https://api.atlasdao.info/api/v1/external/pix/status"
-
-# Se a API exigir taxNumber, defina no ambiente e NÃO perguntaremos ao usuário
 ATLAS_TAX_NUMBER_DEFAULT = os.getenv("ATLAS_TAX_NUMBER_DEFAULT", "").strip()
 
 print(f"✅ Token Telegram: {'OK' if TELEGRAM_TOKEN else '❌ FALTANDO'}")
 print(f"✅ Wallet Address: {WALLET_ADDRESS[:20]}...")
 print("✅ API Key: OK")
-if ATLAS_TAX_NUMBER_DEFAULT:
-    print("✅ TaxNumber default ativo (sem perguntar ao usuário)")
+print(f"ℹ️ Tax default: {'definido' if ATLAS_TAX_NUMBER_DEFAULT else 'não definido'}")
 print("-" * 50)
 
 DATA_FILE = "usuarios.json"
-user_states: Dict[int, str] = {}  # 'day' -> perguntar dia, 'amount' -> valor
+user_states: Dict[int, str] = {}  # 'day' | 'amount' | 'tax'
 
 # Estado de mensagens/controle
-last_message_id: Dict[int, int] = {}   # última mensagem enviada ao user (para substituir)
+last_message_id: Dict[int, int] = {}   # última msg enviada (pra substituir)
 last_payment_id: Dict[int, str] = {}   # último payment id
-paid_flags: Dict[int, bool] = {}       # se já confirmou pagamento no ciclo
+paid_flags: Dict[int, bool] = {}       # pagou no ciclo
 
 # --------------------------- Helpers ---------------------------------------
+def sanitize_tax_number(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
+
+def valid_tax_number(s: str) -> bool:
+    return len(s) in (11, 14)
+
 def formatar_valor_brl(valor: float) -> str:
     return f"{valor:.2f}"
 
@@ -119,13 +123,22 @@ class ClienteManager:
         except Exception as e:
             logger.error(f"Erro ao salvar JSON: {e}")
 
-    def add_or_update(self, user_id: int, username: str, dia: int, valor: float):
+    def add_or_update(self, user_id: int, username: str, dia: int, valor: float, tax_number: Optional[str] = None):
+        if tax_number:
+            tax_number = sanitize_tax_number(tax_number)
         self.clientes[str(user_id)] = {
             "username": username,
             "dia_pagamento": dia,
             "valor": valor,
+            "tax_number": tax_number or self.clientes.get(str(user_id), {}).get("tax_number"),
             "ativo": True,
         }
+        self.save_data()
+
+    def set_tax(self, user_id: int, tax_number: str):
+        c = self.clientes.get(str(user_id)) or {}
+        c["tax_number"] = sanitize_tax_number(tax_number)
+        self.clientes[str(user_id)] = c
         self.save_data()
 
     def get(self, user_id: int):
@@ -184,103 +197,16 @@ def build_banner(qr_image_b64: str, valor_formatado: str, qr_string: str) -> byt
     buf.seek(0)
     return buf.getvalue()
 
-# ---------------------------- API Atlas ------------------------------------
-async def verificar_pagamento(payment_id: str) -> Dict:
-    try:
-        url = f"{ATLAS_API_STATUS}/{payment_id}"
-        headers = {"X-API-Key": ATLAS_API_KEY}
-        r = requests.get(url, headers=headers, timeout=15)
-        if not r.ok:
-            return {"success": False, "error": r.text}
-        data = r.json()
-        return {"success": True, "paid": data.get("status") == "PAID", "data": data}
-    except Exception as e:
-        logger.error(f"verificar_pagamento erro: {e}")
-        return {"success": False, "error": str(e)}
-
-async def gerar_cobranca(
-    user_id: int,
-    username: str,
-    valor: float,
-    context: ContextTypes.DEFAULT_TYPE,
-    schedule_retries: bool = False,
-) -> Optional[str]:
-    """Cria cobrança, envia banner (foto + botão), substitui mensagem anterior e retorna payment_id."""
-    valor_formatado = round(float(valor), 2)
-
-    payload = {
-        "amount": valor_formatado,
-        "description": "Assinatura Mensal OMTB",
-        "walletAddress": WALLET_ADDRESS,
-    }
-    # inclui taxNumber apenas se definido por env
-    if ATLAS_TAX_NUMBER_DEFAULT:
-        payload["taxNumber"] = ATLAS_TAX_NUMBER_DEFAULT
-
-    headers = {"X-API-Key": ATLAS_API_KEY, "Content-Type": "application/json"}
-    logger.info(f"➡️ POST {ATLAS_API_CREATE} payload={payload}")
-
-    try:
-        resp = requests.post(ATLAS_API_CREATE, json=payload, headers=headers, timeout=30)
-        logger.info(f"⬅️ {resp.status_code} {resp.text[:500]}")
-        if not resp.ok:
-            await send_or_replace_text(context, user_id,
-                f"❌ Erro ao gerar cobrança.\n\nCódigo: {resp.status_code}\n{resp.text}")
-            return None
-
-        data = resp.json()
-        payment_id = data.get("id")
-        qr_string  = data.get("qrCode")
-        qr_image   = data.get("qrCodeImage")
-
-        if not qr_image or not qr_string or not payment_id:
-            await send_or_replace_text(context, user_id, "❌ Resposta inválida da API.")
-            return None
-
-        # Gera banner único
-        banner_bytes = build_banner(qr_image, formatar_valor_brl(valor_formatado), qr_string)
-        caption = " "  # info está na imagem
-
-        # teclado com “Já paguei”
-        kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("✅ Já paguei", callback_data=f"verificar_{payment_id}")]]
-        )
-
-        # Substitui mensagem anterior (foto)
-        await send_or_replace_photo(context, user_id, banner_bytes, caption, kb)
-
-        last_payment_id[user_id] = payment_id
-        paid_flags[user_id] = False
-
-        # Agenda reenvio a cada 2h no dia da cobrança (se solicitado)
-        if schedule_retries and context.job_queue:
-            name = f"retry_{user_id}"
-            for j in context.job_queue.get_jobs_by_name(name):
-                j.schedule_removal()
-            context.job_queue.run_repeating(
-                callback=retry_cobranca_job,
-                interval=2 * 60 * 60,   # 2h
-                first=2 * 60 * 60,
-                name=name,
-                data={"user_id": user_id},
-            )
-
-        return payment_id
-
-    except Exception as e:
-        logger.exception("Erro em gerar_cobranca")
-        await send_or_replace_text(context, user_id, f"❌ Erro interno ao gerar cobrança: {e}")
-        return None
-
 # -------------------- Envio substituindo mensagem --------------------------
-async def send_or_replace_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
+async def send_or_replace_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str,
+                               reply_markup: Optional[InlineKeyboardMarkup] = None):
     msg_id = last_message_id.get(chat_id)
     try:
         if msg_id:
             await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
     except Exception:
         pass
-    m = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+    m = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=reply_markup)
     last_message_id[chat_id] = m.message_id
 
 async def send_or_replace_photo(
@@ -309,12 +235,125 @@ async def send_or_replace_photo(
     sent = await context.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption, reply_markup=reply_markup)
     last_message_id[chat_id] = sent.message_id
 
+# ---------------------------- API Atlas ------------------------------------
+async def verificar_pagamento(payment_id: str) -> Dict:
+    try:
+        url = f"{ATLAS_API_STATUS}/{payment_id}"
+        headers = {"X-API-Key": ATLAS_API_KEY}
+        r = requests.get(url, headers=headers, timeout=15)
+        if not r.ok:
+            return {"success": False, "error": r.text}
+        data = r.json()
+        return {"success": True, "paid": data.get("status") == "PAID", "data": data}
+    except Exception as e:
+        logger.error(f"verificar_pagamento erro: {e}")
+        return {"success": False, "error": str(e)}
+
+def _resolve_tax_number(user_id: int) -> Optional[str]:
+    """Ordem: env default -> cadastro -> None"""
+    if ATLAS_TAX_NUMBER_DEFAULT:
+        return sanitize_tax_number(ATLAS_TAX_NUMBER_DEFAULT)
+    cli = clientes_manager.get(user_id)
+    if cli and cli.get("tax_number"):
+        return sanitize_tax_number(cli["tax_number"])
+    return None
+
+async def _ask_tax_number(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Pede CPF/CNPJ com botão de voltar."""
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Voltar para opção anterior", callback_data="voltar_amount")]])
+    user_states[user_id] = "tax"
+    await send_or_replace_text(
+        context, user_id,
+        "Por favor, informe seu *CPF ou CNPJ* (somente números).",
+        reply_markup=kb
+    )
+
+async def gerar_cobranca(
+    user_id: int,
+    username: str,
+    valor: float,
+    context: ContextTypes.DEFAULT_TYPE,
+    schedule_retries: bool = False,
+) -> Optional[str]:
+    """Cria cobrança, envia banner (foto + botões), substitui mensagem anterior e retorna payment_id."""
+    valor_formatado = round(float(valor), 2)
+
+    # Garante taxNumber: se não houver, pede ao usuário
+    tax_number = _resolve_tax_number(user_id)
+    if not tax_number:
+        await _ask_tax_number(user_id, context)
+        return None
+
+    payload = {
+        "amount": valor_formatado,
+        "description": "Assinatura Mensal OMTB",
+        "walletAddress": WALLET_ADDRESS,
+        "taxNumber": tax_number,
+    }
+
+    headers = {"X-API-Key": ATLAS_API_KEY, "Content-Type": "application/json"}
+    logger.info(f"➡️ POST {ATLAS_API_CREATE} payload={payload}")
+
+    try:
+        resp = requests.post(ATLAS_API_CREATE, json=payload, headers=headers, timeout=30)
+        logger.info(f"⬅️ {resp.status_code} {resp.text[:500]}")
+        if not resp.ok:
+            await send_or_replace_text(context, user_id,
+                f"❌ Erro ao gerar cobrança.\n\nCódigo: {resp.status_code}\n{resp.text}")
+            return None
+
+        data = resp.json()
+        payment_id = data.get("id")
+        qr_string  = data.get("qrCode")
+        qr_image   = data.get("qrCodeImage")
+
+        if not qr_image or not qr_string or not payment_id:
+            await send_or_replace_text(context, user_id, "❌ Resposta inválida da API.")
+            return None
+
+        # Gera banner único
+        banner_bytes = build_banner(qr_image, formatar_valor_brl(valor_formatado), qr_string)
+        caption = " "  # info está na imagem
+
+        # teclado: Já paguei + Voltar
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Já paguei", callback_data=f"verificar_{payment_id}")],
+            [InlineKeyboardButton("🔙 Voltar para opção anterior", callback_data="voltar_day")],
+        ])
+
+        await send_or_replace_photo(context, user_id, banner_bytes, caption, kb)
+
+        last_payment_id[user_id] = payment_id
+        paid_flags[user_id] = False
+
+        # Agenda reenvio a cada 2h no dia da cobrança (se solicitado)
+        if schedule_retries and context.job_queue:
+            name = f"retry_{user_id}"
+            for j in context.job_queue.get_jobs_by_name(name):
+                j.schedule_removal()
+            context.job_queue.run_repeating(
+                callback=retry_cobranca_job,
+                interval=2 * 60 * 60,   # 2h
+                first=2 * 60 * 60,
+                name=name,
+                data={"user_id": user_id},
+            )
+
+        return payment_id
+
+    except Exception as e:
+        logger.exception("Erro em gerar_cobranca")
+        await send_or_replace_text(context, user_id, f"❌ Erro interno ao gerar cobrança: {e}")
+        return None
+
 # --------------------------- Fluxo de conversa ------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_states[user.id] = "day"
-    await send_or_replace_text(context, user.id,
-        f"Bem-vindo, *{user.first_name}*!\n\n📅 Qual dia do mês você deseja pagar?")
+    await send_or_replace_text(
+        context, user.id,
+        f"Bem-vindo, *{user.first_name}*!\n\n📅 Qual dia do mês você deseja pagar?"
+    )
 
 async def receber_dia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -324,7 +363,8 @@ async def receber_dia(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data["dia"] = dia
         user_states[update.effective_user.id] = "amount"
-        await send_or_replace_text(context, update.effective_user.id, "💵 Qual o valor (até 3000)?")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Voltar para opção anterior", callback_data="voltar_day")]])
+        await send_or_replace_text(context, update.effective_user.id, "💵 Qual o valor (até 3000)?", reply_markup=kb)
     except ValueError:
         await send_or_replace_text(context, update.effective_user.id, "Digite apenas números.")
 
@@ -338,21 +378,34 @@ async def receber_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         dia = context.user_data.get("dia")
         username = user.first_name or user.username or f"User{user.id}"
+        # salva sem tax por enquanto
         clientes_manager.add_or_update(user.id, username, dia, valor)
+
+        # Se hoje é o dia, já inicia a cobrança (vai pedir tax se faltar)
         user_states[user.id] = None
-
-        await send_or_replace_text(
-            context, user.id,
-            f"✅ Configurado!\nDia: *{dia}*\nValor: *R$ {formatar_valor_brl(valor)}*"
-        )
-
-        # Se hoje é o dia, já cobra e agenda retries
-        if datetime.now().day == dia:
-            await send_or_replace_text(context, user.id, "⏳ Gerando cobrança...")
-            await gerar_cobranca(user.id, username, valor, context, schedule_retries=True)
+        await send_or_replace_text(context, user.id, "⏳ Gerando cobrança...")
+        await gerar_cobranca(user.id, username, valor, context, schedule_retries=True)
 
     except ValueError:
         await send_or_replace_text(context, update.effective_user.id, "Digite apenas números.")
+
+async def receber_tax(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recebe CPF/CNPJ quando necessário."""
+    user_id = update.effective_user.id
+    tax = sanitize_tax_number(update.message.text)
+    if not valid_tax_number(tax):
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Voltar para opção anterior", callback_data="voltar_amount")]])
+        await send_or_replace_text(context, user_id, "Documento inválido. Envie CPF (11) ou CNPJ (14).", reply_markup=kb)
+        user_states[user_id] = "tax"
+        return
+
+    clientes_manager.set_tax(user_id, tax)
+    user_states[user_id] = None
+
+    # Retoma a cobrança
+    cli = clientes_manager.get(user_id)
+    await send_or_replace_text(context, user_id, "⏳ Gerando cobrança...")
+    await gerar_cobranca(user_id, cli["username"], cli["valor"], context, schedule_retries=True)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     estado = user_states.get(update.effective_user.id)
@@ -360,6 +413,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await receber_dia(update, context)
     elif estado == "amount":
         await receber_valor(update, context)
+    elif estado == "tax":
+        await receber_tax(update, context)
     else:
         await send_or_replace_text(context, update.effective_user.id, "Use /start para iniciar.")
 
@@ -370,6 +425,19 @@ async def verificar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     data_text = query.data
     user_id = query.from_user.id
 
+    # Voltar
+    if data_text in {"voltar_day", "voltar_amount"}:
+        if data_text == "voltar_amount":
+            # volta para a pergunta do valor
+            user_states[user_id] = "amount"
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Voltar para opção anterior", callback_data="voltar_day")]])
+            await send_or_replace_text(context, user_id, "💵 Qual o valor (até 3000)?", reply_markup=kb)
+        else:
+            # volta para a pergunta do dia
+            user_states[user_id] = "day"
+            await send_or_replace_text(context, user_id, "📅 Qual dia do mês você deseja pagar?")
+        return
+
     if data_text.startswith("verificar_"):
         payment_id = data_text.replace("verificar_", "")
         await send_or_replace_text(context, user_id, "⏳ Verificando pagamento na rede...")
@@ -378,25 +446,22 @@ async def verificar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if res.get("success") and res.get("paid"):
             paid_flags[user_id] = True
-            # cancela o job de retry, se houver
             if context.job_queue:
                 for j in context.job_queue.get_jobs_by_name(f"retry_{user_id}"):
                     j.schedule_removal()
-
             await send_or_replace_text(
                 context,
                 user_id,
                 "✅ *Pagamento confirmado!*\n\nObrigado! Sua próxima cobrança virá no mês seguinte.",
             )
         else:
-            # Não pago → mantém botão e orienta
             texto = ("❌ *Pagamento não localizado.*\n\n"
                      "Se isso for um erro, contate o suporte e envie seu comprovante.\n"
                      "Caso não tenha efetuado o pagamento, realize-o e toque novamente em *Já paguei*.")
             kb = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("✅ Já paguei", callback_data=f"verificar_{payment_id}")]]
+                [[InlineKeyboardButton("✅ Já paguei", callback_data=f"verificar_{payment_id}")],
+                 [InlineKeyboardButton("🔙 Voltar para opção anterior", callback_data="voltar_day")]]
             )
-            # tenta editar legenda da imagem; se não der, manda texto
             msg_id = last_message_id.get(user_id)
             try:
                 if msg_id:
@@ -404,9 +469,9 @@ async def verificar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         chat_id=user_id, message_id=msg_id, caption=texto, reply_markup=kb, parse_mode="Markdown"
                     )
                 else:
-                    await send_or_replace_text(context, user_id, texto)
+                    await send_or_replace_text(context, user_id, texto, reply_markup=kb)
             except Exception:
-                await send_or_replace_text(context, user_id, texto)
+                await send_or_replace_text(context, user_id, texto, reply_markup=kb)
 
 # ------------------------------- Comandos -----------------------------------
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -425,6 +490,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- Dia da cobrança: *{dia}*\n"
         f"- Valor: *R$ {cliente['valor']:.2f}*\n"
         f"- Próxima cobrança: *{dia:02d}/{proximo_mes:02d}/{ano}*\n"
+        f"- CPF/CNPJ: {'cadastrado' if cliente.get('tax_number') else 'não cadastrado'}"
     )
     await send_or_replace_text(context, update.effective_user.id, txt)
 
@@ -448,12 +514,10 @@ async def retry_cobranca_job(context: ContextTypes.DEFAULT_TYPE):
         context.job.schedule_removal()
         return
 
-    # Se já pago, encerra o job
     if paid_flags.get(user_id):
         context.job.schedule_removal()
         return
 
-    # Se houver payment_id, primeiro verifica
     pid = last_payment_id.get(user_id)
     if pid:
         res = await verificar_pagamento(pid)
@@ -463,7 +527,6 @@ async def retry_cobranca_job(context: ContextTypes.DEFAULT_TYPE):
             context.job.schedule_removal()
             return
 
-    # Ainda não pago → gera uma nova cobrança (novo payment_id / novo QR)
     await gerar_cobranca(
         user_id,
         cliente["username"],
@@ -473,13 +536,12 @@ async def retry_cobranca_job(context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def preparar_cobrancas_do_dia(context: ContextTypes.DEFAULT_TYPE):
-    """Roda diariamente e inicia (se ainda não existir) job a cada 2h para quem cobra hoje."""
+    """Roda diariamente às 8h e inicia (se necessário) as cobranças de quem vence hoje."""
     hoje = datetime.now().day
     for uid, dados in clientes_manager.get_clientes_do_dia(hoje):
         name = f"retry_{uid}"
         if context.job_queue.get_jobs_by_name(name):
             continue
-        # dispara já e repete a cada 2h
         await gerar_cobranca(uid, dados["username"], dados["valor"], context, schedule_retries=True)
 
 # ------------------------------ Menu (botão) --------------------------------
@@ -522,3 +584,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
